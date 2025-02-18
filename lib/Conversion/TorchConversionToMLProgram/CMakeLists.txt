@@ -7,14 +7,12 @@ add_mlir_conversion_library(TorchMLIRTorchConversionToMLProgram
   DEPENDS
   TorchMLIRConversionPassIncGen
 
-  LINK_COMPONENTS
-  Core
-
   LINK_LIBS PUBLIC
   MLIRIR
-  MLIRPass
   MLIRLinalgDialect
+  MLIRMLProgramDialect
   MLIRMathDialect
+  MLIRPass
   TorchMLIRTorchDialect
 )
 

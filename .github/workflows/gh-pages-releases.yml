@@ -1,3 +1,4 @@
+# yamllint disable rule:line-length
 # See: https://github.com/llvm/torch-mlir/issues/1374
 name: Publish releases page
 
@@ -7,14 +8,19 @@ on:
 jobs:
   scrape_and_publish_releases:
     name: "Scrape and publish releases"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     # Don't run this in everyone's forks.
     if: github.repository == 'llvm/torch-mlir'
 
     steps:
+      - name: Prepare workspace
+        run: |
+          # Clear the workspace directory so that we don't run into errors about
+          # existing lock files.
+          sudo rm -rf $GITHUB_WORKSPACE/*
       - name: Checking out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           token: ${{ secrets.WORKFLOW_INVOCATION_TOKEN }}
       - name: Run scrape releases script
@@ -31,7 +37,7 @@ jobs:
       - run: git diff --cached --exit-code || git commit -m "Update releases."
 
       - name: GitHub Push
-        uses: ad-m/github-push-action@v0.6.0
+        uses: ad-m/github-push-action@v0.8.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           branch: github-pages

@@ -47,7 +47,7 @@ def Torch_NnModuleType : Torch_Type<"NnModule", "nn.Module"> {
 // For standard ArrayRefs, which require allocation.
 class OptionalArrayRefTorchParameter<string arrayOf, string desc = ""> :
     AttrOrTypeParameter<
-      "::llvm::Optional<::llvm::ArrayRef<" # arrayOf # ">>", desc> {
+      "::std::optional<::llvm::ArrayRef<" # arrayOf # ">>", desc> {
   let allocator = [{
     if ($_self.has_value()) {
       $_dst.value() = $_allocator.copyInto($_self.value());
@@ -63,12 +63,13 @@ class AnyTorchTensorType<string name, string typeMnemonic>
 
     ```
     tensor-type ::= (`!torch.tensor` | `!torch.vtensor`) tensor-modifiers?
-    tensor-modifiers ::= `<` sizes-spec `,` dtype-spec `>`
+    tensor-modifiers ::= `<` sizes-spec `,` dtype-spec (',' sparsity)? `>`
     sizes-spec ::= `*` | `[` size-list `]`
     size-list ::= /*empty*/ | size-list-nonempty
     size-list-nonempty = size (`,` size)*
     size ::= `?` | decimal-literal
     dtype-spec ::= `unk` | type
+    sparsity ::= attribute-value
     ```
 
     Represents a multi-dimensional array to model Torch's `torch.Tensor` type.
@@ -128,8 +129,17 @@ class AnyTorchTensorType<string name, string typeMnemonic>
     | torch.bool        | i1                 |
     | torch.qint8       | !torch.qint8       |
     | torch.quint8      | !torch.quint8      |
+    | torch.qint32      | !torch.qint32      |
+    | torch.complex64   | complex<f32>       |
+    | torch.complex128  | complex<f64>       |
     |-------------------|--------------------|
     ```
+
+    The `sparsity` attribute directly mirrors the additional tensor `encoding`
+    defined by upstream MLIR on the RankedTensorType. Unlike the upstream
+    attribute, however, this attribute is exclusively used to denote a
+    straightforward tensor (with an empty attribute) or a sparse tensor
+    (with a SparseTensorEncodingAttr).
 
     TODO: Support the full set of Torch dtypes.
     TODO: Use si1?
@@ -147,8 +157,20 @@ class AnyTorchTensorType<string name, string typeMnemonic>
   }];
   let parameters = (ins
     OptionalArrayRefTorchParameter<"int64_t", "sizes of dimensions">:$optionalSizes,
-    "::mlir::Type":$optionalDtype
+    "::mlir::Type":$optionalDtype,
+    "Attribute":$optionalSparsity
   );
+  let builders = [
+    // Provide builder where optionalSparsity is empty by default.
+    TypeBuilder<(ins
+      "::std::optional<ArrayRef<int64_t>>":$optionalSizes,
+      "::mlir::Type":$optionalDtype,
+      CArg<"Attribute", "{}">:$optionalSparsity
+    ), [{
+      return $_get(context, optionalSizes, optionalDtype, optionalSparsity);
+    }]>
+  ];
+  let skipDefaultBuilders = 1;
   let genVerifyDecl = 1;
   let hasCustomAssemblyFormat = 1;
   string extraBaseClassDeclaration = [{
@@ -177,7 +199,7 @@ def Torch_ValueTensorType : AnyTorchTensorType<"ValueTensor", "vtensor"> {
 }
 
 def AnyTorchTensorType : Type<
-    CPred<"$_self.isa<::mlir::torch::Torch::BaseTensorType>()">,
+    CPred<"isa<::mlir::torch::Torch::BaseTensorType>($_self)">,
     "Any Torch tensor type"
 >;
 
@@ -293,8 +315,29 @@ def Torch_QInt8Type : Torch_Type<"QInt8", "qint8"> {
   }];
 }
 
+def Torch_QInt16Type : Torch_Type<"QInt16", "qint16"> {
+  let summary = "Type modeling `ScalarType::QInt16`, which doesn't yet exist";
+  let description = [{
+    Pytorch does not have 16-bit integer quantization support.
+
+    This torch type is added to provide a target for 16-bit quantization
+    schemes coming from imported onnx models.
+  }];
+}
+
 def Torch_QUInt8Type : Torch_Type<"QUInt8", "quint8"> {
   let summary = "Type modeling `ScalarType::QUInt8`";
+  let description = [{
+    This is intended to be a 1:1 match for the Torch `ScalarType` types.
+
+    Looking at the variety / ad-hocness (e.g. `QUInt4x2`) of that set of
+    types, it is deemed preferable to import them as one-off ad-hoc types
+    instead of a single parameterized type.
+  }];
+}
+
+def Torch_QInt32Type : Torch_Type<"QInt32", "qint32"> {
+  let summary = "Type modeling `ScalarType::QInt32`";
   let description = [{
     This is intended to be a 1:1 match for the Torch `ScalarType` types.
 
@@ -346,6 +389,7 @@ def Torch_DictType : Torch_Type<"Dict", "dict"> {
     Torch Dict type with key and value type.
   }];
   let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
   let builders = [
     TypeBuilderWithInferredContext<(ins "::mlir::Type":$keyType,
                                         "::mlir::Type":$valueType), [{
@@ -363,6 +407,8 @@ class OptionalOf<Type type, string descr> :
 
 def AnyTorchOptionalTensorType :
       OptionalOf<AnyTorchTensorType, "Optional torch tensor type">;
+def AnyTorchOptionalNonValueTensorType :
+      OptionalOf<Torch_NonValueTensorType, "Optional torch non value tensor type">;
 def AnyTorchOptionalIntType: OptionalOf<Torch_IntType, "Optional torch int type">;
 def AnyTorchOptionalFloatType: OptionalOf<Torch_FloatType, "Optional torch float type">;
 def AnyTorchOptionalBoolType:
@@ -374,11 +420,11 @@ def AnyTorchOptionalDeviceType:
 def AnyTorchOptionalGeneratorType:
       OptionalOf<Torch_GeneratorType, "Optional torch Generator type">;
 
-def IsListTypePred : CPred<"$_self.isa<::mlir::torch::Torch::ListType>()">;
+def IsListTypePred : CPred<"isa<::mlir::torch::Torch::ListType>($_self)">;
 class ListOf<list<Type> allowedTypes, string descr> :
     ContainerType<AnyTypeOf<allowedTypes>,
             IsListTypePred,
-            "$_self.cast<::mlir::torch::Torch::ListType>().getContainedType()",
+            "cast<::mlir::torch::Torch::ListType>($_self).getContainedType()",
             descr, "::mlir::torch::Torch::ListType">;
 
 def AnyTorchListOfTorchBoolType : ListOf<[Torch_BoolType], "Bool list type (bool[])">;
@@ -387,8 +433,13 @@ def AnyTorchListOfTorchFloatType : ListOf<[Torch_FloatType], "Float list type (f
 def AnyTorchListOfTorchStringType : ListOf<[Torch_StringType], "Str list type (str[])">;
 def AnyTorchListOfTensorType:
       ListOf<[AnyTorchTensorType], "Any int list type (Tensor[])">;
+def AnyTorchListOfNonValueTensorType:
+      ListOf<[Torch_NonValueTensorType], "Any int list type (Tensor[])">;
 def AnyTorchListOfOptionalTensorType :
       ListOf<[AnyTorchOptionalTensorType],
+             "Any optional tensor list type (Tensor?[])">;
+def AnyTorchListOfOptionalNonValueTensorType :
+      ListOf<[AnyTorchOptionalNonValueTensorType],
              "Any optional tensor list type (Tensor?[])">;
 def AnyTorchListOfOptionalIntType :
       ListOf<[AnyTorchOptionalIntType],
@@ -410,7 +461,6 @@ def AnyTorchDictKeyType : AnyTypeOf<[
   Torch_BoolType,
   Torch_FloatType,
   Torch_StringType,
-  Torch_FloatType,
   AnyTorchTensorType,
 ], "Allowed dict key types">;
 

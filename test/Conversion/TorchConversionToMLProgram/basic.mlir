@@ -10,10 +10,23 @@
 // CHECK:           %[[NEXT_SEED:.*]] = arith.addi %[[MUL]], %[[INC]] : i64
 // CHECK:           %[[INSERTED:.*]] = tensor.insert %[[NEXT_SEED]] into %[[GLOBAL]][] : tensor<i64>
 // CHECK:           ml_program.global_store @global_seed = %[[INSERTED]] : tensor<i64>
-// CHECK:           return %2 : i64
+// CHECK:           return %[[NEXT_SEED]] : i64
 module {
   func.func @f() -> i64 {
     %seed = torch_c.get_next_seed : () -> i64
     return %seed : i64
   }
 }
+
+// -----
+
+module {
+  func.func @no_seed_needed(%arg0: tensor<2x3xf32>) -> !torch.vtensor<[2,3],f32> {
+    %0 = torch_c.from_builtin_tensor %arg0 : tensor<2x3xf32> -> !torch.vtensor<[2,3],f32>
+    return %0 : !torch.vtensor<[2,3],f32>
+  }
+}
+
+// CHECK-NOT: ml_program.global
+// CHECK-LABEL: @no_seed_needed
+// CHECK-NEXT: torch_c.from_builtin_tensor

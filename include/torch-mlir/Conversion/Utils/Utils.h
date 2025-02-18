@@ -40,6 +40,8 @@ Value createInitTensor(OpBuilder &b, Location loc, ValueRange sizes,
 
 Value createZeroInitTensor(OpBuilder &b, Location loc, ValueRange sizes,
                            Type elemTy);
+Value createOneInitTensor(OpBuilder &b, Location loc, ValueRange sizes,
+                          Type elemTy);
 
 Value castIntToIndex(OpBuilder &b, Location loc, Value v);
 
@@ -76,16 +78,34 @@ SmallVector<Value> getAsConstantIndexValues(OpBuilder &b, Location loc,
 // convert their elements to valid target type.
 // TODO: remove this when list gets full support.
 SmallVector<Value> getTypeConvertedValues(OpBuilder &b, Location loc,
-                                          TypeConverter *converter,
+                                          const TypeConverter *converter,
                                           SmallVectorImpl<Value> &vs);
+
+mlir::RankedTensorType GetTypeFromTensorShape(llvm::ArrayRef<int64_t> shape,
+                                              mlir::Type elementType,
+                                              mlir::Attribute encoding = {});
 
 // Convert a scalar value to the target type. The scalar value can be an element
 // from a tensor or a scalar in the pytorch dialect. Both the scalar and dtype
 // should be converted builtin types.
-Value convertScalarToDtype(
-    OpBuilder &b, Location loc, Value scalar, Type dtype,
-    llvm::Optional<Type> srcOriginalDtype = std::nullopt);
+Value convertScalarToDtype(OpBuilder &b, Location loc, Value scalar, Type dtype,
+                           std::optional<Type> srcOriginalDtype = std::nullopt,
+                           std::optional<Type> dstOriginalDtype = std::nullopt,
+                           std::optional<Value> originalScalar = std::nullopt);
 
+Value toPositiveValidDim(ConversionPatternRewriter &rewriter, Location loc,
+                         Value torchOptionalInt, Value builtinInt,
+                         Value defaultValue, Value dimSize);
+
+// Helper function to unsqueeze the input tensor at given dim.
+// Returns the unsqueezed tensor or failure.
+FailureOr<Value> unsqueezeTensor(PatternRewriter &rewriter, Operation *op,
+                                 Value input, int64_t dim);
+
+// Helper function to squeeze the input tensor at given dim.
+// Returns the squeezed tensor or failure.
+FailureOr<Value> squeezeTensor(PatternRewriter &rewriter, Operation *op,
+                               Value input, int64_t dim);
 } // namespace Torch
 } // namespace torch
 } // namespace mlir

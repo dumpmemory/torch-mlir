@@ -9,8 +9,6 @@
 
 #include "PassDetail.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -23,9 +21,31 @@ using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 
 static Value assertNonValueTensor(Value tensor) {
-  assert(tensor.getType().isa<NonValueTensorType>() &&
+  assert(isa<NonValueTensorType>(tensor.getType()) &&
          "tensor is expected to be a non-value tensor");
   return tensor;
+}
+
+// A cast-like op is an op that does not modify the contents, shape, and dtype
+// of the input tensor. In other words, it is an op that only serves to encode
+// compile time information, but at runtime the op behaves like a no-op.
+static bool isCastLikeOp(Operation *op) {
+  return isa<TensorStaticInfoCastOp>(op);
+}
+
+// Given a `value`, this function goes up the use-def chain and finds the
+// largest sequence of consecutive cast-like ops. The returned set contains all
+// the aliases that are identical to `value`, and have only been transformed by
+// cast-like ops.
+static DenseSet<Value> getCastLikeAliasesOf(Value value) {
+  Operation *currentOp = value.getDefiningOp();
+  DenseSet<Value> result;
+  while (isCastLikeOp(currentOp)) {
+    Value operand = assertNonValueTensor(currentOp->getOperand(0));
+    result.insert(operand);
+    currentOp = operand.getDefiningOp();
+  }
+  return result;
 }
 
 namespace {
@@ -40,7 +60,7 @@ public:
     SmallVector<Operation *> copyLikeOps;
     SmallVector<Operation *> viewLikeOps;
     SmallVector<OverwriteTensorContentsOp> overwriteTensorContentsOps;
-    Optional<mlir::func::ReturnOp> returnOp;
+    std::optional<mlir::func::ReturnOp> returnOp;
   };
 
   // Check that graph rewriting is possible by doing an abstract
@@ -80,7 +100,7 @@ public:
         // to use value semantics (which happens for example with ops
         // that take two aliases as input), then it is possible that the
         // op no longer generates an alias.
-        if (userResult.getType().isa<NonValueTensorType>())
+        if (isa<NonValueTensorType>(userResult.getType()))
           availableAliases.insert(userResult);
         result.viewLikeOps.push_back(user);
       } else if (auto copyToValueTensor = dyn_cast<CopyToValueTensorOp>(user)) {
@@ -88,9 +108,13 @@ public:
       } else if (auto overwrite = dyn_cast<OverwriteTensorContentsOp>(user)) {
         // To simplify the analysis, we only support the case where the
         // only aliases used after an overwrite are the aliases generated
-        // after plus the alias being overwritten.
+        // after plus the alias being overwritten and any aliases that are
+        // simply a cast of the overwritten alias.
         availableAliases.clear();
-        availableAliases.insert(assertNonValueTensor(overwrite.getOverwritten()));
+        Value overwritten = overwrite.getOverwritten();
+        availableAliases.insert(assertNonValueTensor(overwritten));
+        DenseSet<Value> castLikeAliases = getCastLikeAliasesOf(overwritten);
+        availableAliases.insert(castLikeAliases.begin(), castLikeAliases.end());
         result.overwriteTensorContentsOps.push_back(overwrite);
       } else if (auto returnOp = dyn_cast<mlir::func::ReturnOp>(user)) {
         result.returnOp = returnOp;
@@ -114,7 +138,7 @@ public:
       auto returnOp = ops.returnOp.value();
       for (auto operand : llvm::enumerate(returnOp->getOperands())) {
         auto type = operand.value().getType();
-        if (!type.isa<NonValueTensorType>())
+        if (!isa<NonValueTensorType>(type))
           continue;
         originalReturnTypes[operand.index()] = type;
       }
@@ -128,10 +152,19 @@ public:
     for (OverwriteTensorContentsOp overwrite :
          llvm::reverse(ops.overwriteTensorContentsOps)) {
       Value overwritten = assertNonValueTensor(overwrite.getOverwritten());
-      overwritten.replaceUsesWithIf(
-          overwrite.getValue(), [&](const OpOperand &operand) {
-            return !operand.getOwner()->isBeforeInBlock(overwrite);
-          });
+      // Cast-like aliases represent the exact same tensor at runtime as the
+      // overwritten alias, since casts only encode compile time information.
+      // Therefore, here we replace the overwritten value and any cast-like
+      // aliases of it with the overwrite value.
+      DenseSet<Value> overwrittenAliases = getCastLikeAliasesOf(overwritten);
+      overwrittenAliases.insert(overwritten);
+
+      for (Value alias : overwrittenAliases) {
+        alias.replaceUsesWithIf(
+            overwrite.getValue(), [&](const OpOperand &operand) {
+              return !operand.getOwner()->isBeforeInBlock(overwrite);
+            });
+      }
       rewriter.eraseOp(overwrite);
     }
 
@@ -140,9 +173,9 @@ public:
 
     // Replace return type of view-like ops with value-semantics type variant.
     for (Operation *viewLikeOp : ops.viewLikeOps) {
-      rewriter.updateRootInPlace(viewLikeOp, [&] {
+      rewriter.modifyOpInPlace(viewLikeOp, [&] {
         Value result = viewLikeOp->getResult(0);
-        auto resultType = result.getType().dyn_cast<NonValueTensorType>();
+        auto resultType = dyn_cast<NonValueTensorType>(result.getType());
         if (resultType)
           result.setType(resultType.getWithValueSemantics());
       });
@@ -154,7 +187,7 @@ public:
         auto it = originalReturnTypes.find(i);
         if (it == originalReturnTypes.end())
           continue;
-        auto originalType = it->second.cast<NonValueTensorType>();
+        auto originalType = cast<NonValueTensorType>(it->second);
         rewriter.setInsertionPoint(returnOp);
         Value newReturnValue = copyTensorToType(rewriter, returnOp->getLoc(),
                                                 originalType, operand.get());
@@ -195,7 +228,7 @@ public:
       if (isViewLikeOp(op)) {
         // We currently only support view-like ops with one tensor output.
         if (op->getNumResults() != 1 ||
-            !op->getResult(0).getType().isa<BaseTensorType>()) {
+            !isa<BaseTensorType>(op->getResult(0).getType())) {
           return rewriter.notifyMatchFailure(
               copy, "unsupported: view-like ops must have one tensor output, "
                     "and the tensor output must be the first result");
@@ -207,7 +240,7 @@ public:
         // non-value tensor and the output being a value tensor. If this is the
         // case then there is no need to look at the users of the result of the
         // op.
-        if (opResult.getType().isa<NonValueTensorType>()) {
+        if (isa<NonValueTensorType>(opResult.getType())) {
           if (operand.getOperandNumber() == 0) {
             validViewLikeOps.insert(op);
             llvm::append_range(workList, opResult.getUses());
@@ -302,9 +335,9 @@ public:
     // correctly copy them back to their mlir::func::ReturnOp's expected types.
     DenseMap<Value, Type> originalTypes;
     for (Operation *op : viewLikeOps) {
-      rewriter.updateRootInPlace(op, [&]() {
+      rewriter.modifyOpInPlace(op, [&]() {
         if (auto nonValueTensorType =
-                op->getResult(0).getType().dyn_cast<NonValueTensorType>()) {
+                dyn_cast<NonValueTensorType>(op->getResult(0).getType())) {
           originalTypes[op->getResult(0)] = nonValueTensorType;
           op->getResult(0).setType(nonValueTensorType.getWithValueSemantics());
         }
@@ -317,7 +350,7 @@ public:
         auto it = originalTypes.find(operand.get());
         if (it == originalTypes.end())
           continue;
-        auto originalType = it->second.cast<BaseTensorType>();
+        auto originalType = cast<BaseTensorType>(it->second);
         rewriter.setInsertionPoint(op);
         Value newReturnValue = copyTensorToType(rewriter, op->getLoc(),
                                                 originalType, operand.get());
@@ -339,7 +372,7 @@ class MaximizeValueSemanticsPass
     RewritePatternSet patterns(context);
     patterns.insert<AbstractlyInterpretCopyToNonValueTensorOpUsersWithinABlock,
                     RewriteViewLikeSubgraph>(context);
-    (void)applyPatternsAndFoldGreedily(func, std::move(patterns));
+    (void)applyPatternsGreedily(func, std::move(patterns));
   }
 };
 

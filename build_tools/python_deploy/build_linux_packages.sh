@@ -16,7 +16,7 @@
 #   ./build_tools/python_deploy/build_linux_packages.sh
 #
 # Build specific Python versions and packages to custom directory:
-#   TM_PYTHON_VERSIONS="cp38-cp38 cp39-cp39" \
+#   TM_PYTHON_VERSIONS="cp39-cp39 cp310-cp310" \
 #   TM_PACKAGES="torch-mlir" \
 #   TM_OUTPUT_DIR="/tmp/wheelhouse" \
 #   ./build_tools/python_deploy/build_linux_packages.sh
@@ -38,23 +38,27 @@ set -eu -o errtrace
 
 this_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$this_dir"/../../ && pwd)"
+arch="$(uname -m)"
+echo "Running on Arch: ${arch}"
 # This needs to be a manylinux image so we can ship pip packages
-TM_RELEASE_DOCKER_IMAGE="${TM_RELEASE_DOCKER_IMAGE:-stellaraccident/manylinux2014_x86_64-bazel-5.1.0:latest}"
+TM_RELEASE_DOCKER_IMAGE="${TM_RELEASE_DOCKER_IMAGE:-quay.io/pypa/manylinux2014_${arch}}"
 # This assumes an Ubuntu LTS like image. You can build your own with
 # ./build_tools/docker/Dockerfile
 TM_CI_DOCKER_IMAGE="${TM_CI_DOCKER_IMAGE:-powderluv/torch-mlir-ci:latest}"
 # Version of Python to use in Release builds. Ignored in CIs.
-TM_PYTHON_VERSIONS="${TM_PYTHON_VERSIONS:-cp37-cp37m cp310-cp310}"
+TM_PYTHON_VERSIONS="${TM_PYTHON_VERSIONS:-cp310-cp310 cp311-cp311 cp312-cp312}"
 # Location to store Release wheels
 TM_OUTPUT_DIR="${TM_OUTPUT_DIR:-${this_dir}/wheelhouse}"
 # What "packages to build"
-TM_PACKAGES="${TM_PACKAGES:-torch-mlir}"
+TM_PACKAGES="${TM_PACKAGES:-torch-mlir torch-mlir-ext}"
 # Use pre-built Pytorch
 TM_USE_PYTORCH_BINARY="${TM_USE_PYTORCH_BINARY:-ON}"
 # Skip running tests if you want quick iteration
 TM_SKIP_TESTS="${TM_SKIP_TESTS:-OFF}"
 # Update ODS and abstract interpretation library files
 TM_UPDATE_ODS_AND_ABSTRACT_INTERP_LIB="${TM_UPDATE_ODS_AND_ABSTRACT_INTERP_LIB:-OFF}"
+# Determine if we use a stable or a nightly torch build
+TM_TORCH_VERSION="${TM_TORCH_VERSION:-nightly}"
 
 PKG_VER_FILE="${repo_root}"/torch_mlir_package_version ; [ -f "$PKG_VER_FILE" ] && . "$PKG_VER_FILE"
 TORCH_MLIR_PYTHON_PACKAGE_VERSION="${TORCH_MLIR_PYTHON_PACKAGE_VERSION:-0.0.1}"
@@ -79,6 +83,11 @@ function run_on_host() {
   fi
   mkdir -p "${TM_OUTPUT_DIR}"
   case "$package" in
+    torch-mlir-ext)
+      TM_CURRENT_DOCKER_IMAGE=${TM_RELEASE_DOCKER_IMAGE}
+      export USERID=0
+      export GROUPID=0
+      ;;
     torch-mlir)
       TM_CURRENT_DOCKER_IMAGE=${TM_RELEASE_DOCKER_IMAGE}
       export USERID=0
@@ -124,6 +133,7 @@ function run_on_host() {
     -e "TORCH_MLIR_SRC_PYTORCH_REPO=${TORCH_MLIR_SRC_PYTORCH_REPO}" \
     -e "TORCH_MLIR_SRC_PYTORCH_BRANCH=${TORCH_MLIR_SRC_PYTORCH_BRANCH}" \
     -e "TM_PYTORCH_INSTALL_WITHOUT_REBUILD=${TM_PYTORCH_INSTALL_WITHOUT_REBUILD}" \
+    -e "TM_TORCH_VERSION=${TM_TORCH_VERSION}" \
     -e "CCACHE_DIR=/main_checkout/torch-mlir/.ccache" \
     "${TM_CURRENT_DOCKER_IMAGE}" \
     /bin/bash /main_checkout/torch-mlir/build_tools/python_deploy/build_linux_packages.sh
@@ -148,27 +158,39 @@ function run_in_docker() {
       export PATH=$python_dir/bin:$orig_path
       echo ":::: Python version $(python3 --version)"
       case "$package" in
-        torch-mlir)
-          clean_wheels torch_mlir "$python_version"
-          build_torch_mlir
+        torch-mlir-ext)
+          clean_wheels torch_mlir_ext "$python_version"
+          build_torch_mlir_ext "$TM_TORCH_VERSION"
 
           # Disable audit wheel until we can fix ODR torch issues.  See
           # https://github.com/llvm/torch-mlir/issues/1709
           #
-          #run_audit_wheel torch_mlir "$python_version"
+          #run_audit_wheel torch_mlir_ext "$python_version"
 
+          clean_build torch_mlir_ext "$python_version"
+          ;;
+        torch-mlir)
+          clean_wheels torch_mlir "$python_version"
+          build_torch_mlir
+          run_audit_wheel torch_mlir "$python_version"
           clean_build torch_mlir "$python_version"
           ;;
         out-of-tree)
-          setup_venv "$python_version"
-          build_out_of_tree "$TM_USE_PYTORCH_BINARY" "$python_version"
+          setup_venv "$python_version" "$TM_TORCH_VERSION"
+          build_out_of_tree "$TM_USE_PYTORCH_BINARY" "$python_version" "$TM_TORCH_VERSION"
+          if [ "${TM_UPDATE_ODS_AND_ABSTRACT_INTERP_LIB}" == "ON" ]; then
+            pushd /main_checkout/torch-mlir
+            TORCH_MLIR_BUILD_DIR=/main_checkout/torch-mlir/build_oot ./build_tools/update_torch_ods.sh
+            TORCH_MLIR_BUILD_DIR=/main_checkout/torch-mlir/build_oot ./build_tools/update_abstract_interp_lib.sh
+            popd
+          fi
           if [ "${TM_SKIP_TESTS}" == "OFF" ]; then
             test_out_of_tree
           fi
           ;;
         in-tree)
-          setup_venv "$python_version"
-          build_in_tree "$TM_USE_PYTORCH_BINARY" "$python_version"
+          setup_venv "$python_version" "$TM_TORCH_VERSION"
+          build_in_tree "$TM_USE_PYTORCH_BINARY" "$python_version" "$TM_TORCH_VERSION"
           if [ "${TM_UPDATE_ODS_AND_ABSTRACT_INTERP_LIB}" == "ON" ]; then
             pushd /main_checkout/torch-mlir
             ./build_tools/update_torch_ods.sh
@@ -176,7 +198,7 @@ function run_in_docker() {
             popd
           fi
           if [ "${TM_SKIP_TESTS}" == "OFF" ]; then
-            test_in_tree;
+            test_in_tree "$TM_TORCH_VERSION";
           fi
           ;;
         *)
@@ -192,6 +214,14 @@ function run_in_docker() {
 function build_in_tree() {
   local torch_from_bin="$1"
   local python_version="$2"
+
+  local torch_version="$3"
+  local enable_ltc="ON"
+  if [[ "${torch_version}" == "stable" ]]
+  then
+    enable_ltc="OFF"
+  fi
+
   echo ":::: Build in-tree Torch from binary: $torch_from_bin with Python: $python_version"
   cmake -GNinja -B/main_checkout/torch-mlir/build \
       -DCMAKE_BUILD_TYPE=Release \
@@ -204,19 +234,18 @@ function build_in_tree() {
       -DCMAKE_C_COMPILER_LAUNCHER=ccache \
       -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DLLVM_ENABLE_PROJECTS=mlir \
-      -DLLVM_EXTERNAL_PROJECTS="torch-mlir;torch-mlir-dialects" \
+      -DLLVM_EXTERNAL_PROJECTS="torch-mlir" \
       -DLLVM_EXTERNAL_TORCH_MLIR_SOURCE_DIR="/main_checkout/torch-mlir" \
-      -DLLVM_EXTERNAL_TORCH_MLIR_DIALECTS_SOURCE_DIR="/main_checkout/torch-mlir/externals/llvm-external-projects/torch-mlir-dialects" \
       -DLLVM_TARGETS_TO_BUILD=host \
       -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
-      -DTORCH_MLIR_ENABLE_LTC=ON \
+      -DTORCH_MLIR_ENABLE_LTC=${enable_ltc} \
       -DTORCH_MLIR_USE_INSTALLED_PYTORCH="$torch_from_bin" \
       -DTORCH_MLIR_SRC_PYTORCH_REPO=${TORCH_MLIR_SRC_PYTORCH_REPO} \
       -DTORCH_MLIR_SRC_PYTORCH_BRANCH=${TORCH_MLIR_SRC_PYTORCH_BRANCH} \
       -DTM_PYTORCH_INSTALL_WITHOUT_REBUILD=${TM_PYTORCH_INSTALL_WITHOUT_REBUILD} \
       -DPython3_EXECUTABLE="$(which python3)" \
       /main_checkout/torch-mlir/externals/llvm-project/llvm
-  cmake --build /main_checkout/torch-mlir/build
+  cmake --build /main_checkout/torch-mlir/build --target tools/torch-mlir/all
   ccache -s
 }
 
@@ -252,50 +281,95 @@ function _check_file_not_changed_by() {
 }
 
 function test_in_tree() {
+  local torch_version="$1"
+
   echo ":::: Test in-tree"
   cmake --build /main_checkout/torch-mlir/build --target check-torch-mlir-all
 
   cd /main_checkout/torch-mlir/
-  export PYTHONPATH="/main_checkout/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir"
+  export PYTHONPATH="/main_checkout/torch-mlir/build/tools/torch-mlir/python_packages/torch_mlir:/main_checkout/torch-mlir/projects/pt1"
 
-  echo ":::: Check that update_abstract_interp_lib.sh has been run"
-  _check_file_not_changed_by ./build_tools/update_abstract_interp_lib.sh lib/Dialect/Torch/Transforms/AbstractInterpLibrary.cpp
+  case $torch_version in
+    nightly)
+      echo ":::: Test with nightly torch"
 
-  echo ":::: Check that update_torch_ods.sh has been run"
-  _check_file_not_changed_by ./build_tools/update_torch_ods.sh include/torch-mlir/Dialect/Torch/IR/GeneratedTorchOps.td
+      echo ":::: Check that update_abstract_interp_lib.sh has been run"
+      _check_file_not_changed_by ./build_tools/update_abstract_interp_lib.sh lib/Dialect/Torch/Transforms/AbstractInterpLibrary.cpp
 
-  echo ":::: Run Linalg e2e integration tests"
-  python -m e2e_testing.main --config=linalg -v
+      echo ":::: Check that update_torch_ods.sh has been run"
+      _check_file_not_changed_by ./build_tools/update_torch_ods.sh include/torch-mlir/Dialect/Torch/IR/GeneratedTorchOps.td
 
-  echo ":::: Run MHLO e2e integration tests"
-  python -m e2e_testing.main --config=mhlo -v
+      echo ":::: Run Lazy Tensor Core e2e integration tests"
+      python -m e2e_testing.main --config=lazy_tensor_core -v
+
+      echo ":::: Run Linalg e2e integration tests"
+      python -m e2e_testing.main --config=linalg -v
+
+      echo ":::: Run Onnx e2e integration tests"
+      python -m e2e_testing.main --config=onnx -v
+
+      echo ":::: Run FxImporter e2e integration tests"
+      python -m e2e_testing.main --config=fx_importer -v
+      ;;
+    stable)
+      echo ":::: Test with stable torch"
+
+      # Disabled until the next stable PyTorch release (v2.1) is available
+      # echo ":::: Run Lazy Tensor Core e2e integration tests in experimental mode"
+      # python -m e2e_testing.main --config=lazy_tensor_core -v --ignore_failures
+      ;;
+    *)
+      echo "Unrecognized torch version '$torch_version'"
+      exit 1
+      ;;
+    esac
 
   echo ":::: Run TOSA e2e integration tests"
   python -m e2e_testing.main --config=tosa -v
-
-  echo ":::: Run Lazy Tensor Core e2e integration tests"
-  python -m e2e_testing.main --config=lazy_tensor_core -v
-
-  echo ":::: Run TorchDynamo e2e integration tests"
-  python -m e2e_testing.main --config=torchdynamo -v
 }
 
 function setup_venv() {
   local python_version="$1"
-  echo ":::: Setting up VENV with Python: $python_version"
+  local torch_version="$2"
+
+  echo ":::: Setting up VENV with Python: $python_version PyTorch $torch_version"
   python3 -m venv /main_checkout/torch-mlir/docker_venv
   source /main_checkout/torch-mlir/docker_venv/bin/activate
 
   echo ":::: pip installing dependencies"
   python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/externals/llvm-project/mlir/python/requirements.txt
-  python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/requirements.txt
 
+  case $torch_version in
+    nightly)
+      echo ":::: Using nightly dependencies"
+      python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/requirements.txt
+      python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/torchvision-requirements.txt
+      ;;
+    stable)
+      echo ":::: Using stable dependencies"
+      python3 -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/build-requirements.txt
+      ;;
+    *)
+      echo "Unrecognized torch version '$torch_version'"
+      exit 1
+      ;;
+  esac
+
+  python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/test-requirements.txt
 }
 
 function build_out_of_tree() {
   local torch_from_bin="$1"
   local python_version="$2"
-  echo ":::: Build out-of-tree Torch from binary: $torch_from_bin with Python: $python_version"
+  local torch_version="$3"
+  echo ":::: Build out-of-tree Torch from binary: $torch_from_bin with Python: $python_version ($torch_version)"
+
+  local enable_ltc="ON"
+  if [[ "${torch_version}" == "stable" ]]
+  then
+    enable_ltc="OFF"
+  fi
 
   if [ ! -d "/main_checkout/torch-mlir/llvm-build/lib/cmake/mlir/" ]
   then
@@ -330,7 +404,7 @@ function build_out_of_tree() {
       -DLLVM_DIR="/main_checkout/torch-mlir/llvm-build/lib/cmake/llvm/" \
       -DMLIR_DIR="/main_checkout/torch-mlir/llvm-build/lib/cmake/mlir/" \
       -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
-      -DTORCH_MLIR_ENABLE_LTC=ON \
+      -DTORCH_MLIR_ENABLE_LTC=${enable_ltc} \
       -DTORCH_MLIR_USE_INSTALLED_PYTORCH="$torch_from_bin" \
       -DTORCH_MLIR_SRC_PYTORCH_REPO=${TORCH_MLIR_SRC_PYTORCH_REPO} \
       -DTORCH_MLIR_SRC_PYTORCH_BRANCH=${TORCH_MLIR_SRC_PYTORCH_BRANCH} \
@@ -354,23 +428,54 @@ function clean_build() {
   rm -rf /main_checkout/torch-mlir/build /main_checkout/torch-mlir/llvm-build /main_checkout/torch-mlir/docker_venv  /main_checkout/torch-mlir/libtorch
 }
 
-function build_torch_mlir() {
-  python -m pip install --no-cache-dir -r /main_checkout/torch-mlir/requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/nightly/cpu/torch_nightly.html
-  CMAKE_GENERATOR=Ninja \
-  TORCH_MLIR_PYTHON_PACKAGE_VERSION=${TORCH_MLIR_PYTHON_PACKAGE_VERSION} \
-  python -m pip wheel -v -w /wheelhouse /main_checkout/torch-mlir \
-    -f https://download.pytorch.org/whl/nightly/cpu/torch_nightly.html \
-    -r /main_checkout/torch-mlir/whl-requirements.txt
+function build_torch_mlir_ext() {
+  # Disable LTC build for releases
+  export TORCH_MLIR_ENABLE_LTC=0
+  local torch_version="$1"
+  case $torch_version in
+    nightly)
+      echo ":::: Using nightly dependencies"
+      python -m pip install --no-cache-dir -r /main_checkout/torch-mlir/requirements.txt \
+        --extra-index-url https://download.pytorch.org/whl/nightly/cpu/torch/
+      CMAKE_GENERATOR=Ninja \
+      TORCH_MLIR_PYTHON_PACKAGE_VERSION=${TORCH_MLIR_PYTHON_PACKAGE_VERSION} \
+      python -m pip wheel -v --no-build-isolation -w /wheelhouse /main_checkout/torch-mlir \
+        -f https://download.pytorch.org/whl/nightly/cpu/torch/ \
+        -r /main_checkout/torch-mlir/whl-requirements.txt
+      ;;
+    stable)
+      echo ":::: Using stable dependencies"
+      python3 -m pip install --no-cache-dir torch torchvision
+      python3 -m pip install --no-cache-dir -r /main_checkout/torch-mlir/build-requirements.txt
+      CMAKE_GENERATOR=Ninja \
+      TORCH_MLIR_PYTHON_PACKAGE_VERSION=${TORCH_MLIR_PYTHON_PACKAGE_VERSION} \
+      python -m pip wheel -v --no-build-isolation -w /wheelhouse /main_checkout/torch-mlir
+      ;;
+    *)
+      echo "Unrecognized torch version '$torch_version'"
+      exit 1
+      ;;
+  esac
 }
 
 function run_audit_wheel() {
   local wheel_basename="$1"
   local python_version="$2"
-  generic_wheel="/wheelhouse/${wheel_basename}-${TORCH_MLIR_PYTHON_PACKAGE_VERSION}-${python_version}-linux_x86_64.whl"
+  generic_wheel="/wheelhouse/${wheel_basename}-${TORCH_MLIR_PYTHON_PACKAGE_VERSION}-${python_version}-linux_${arch}.whl"
   echo ":::: Auditwheel $generic_wheel"
   auditwheel repair -w /wheelhouse "$generic_wheel"
   rm "$generic_wheel"
+}
+
+function build_torch_mlir() {
+  # Disable LTC build for releases
+  export TORCH_MLIR_ENABLE_LTC=0
+  python -m pip install --no-cache-dir -r /main_checkout/torch-mlir/build-requirements.txt
+  CMAKE_GENERATOR=Ninja \
+  TORCH_MLIR_PYTHON_PACKAGE_VERSION=${TORCH_MLIR_PYTHON_PACKAGE_VERSION} \
+  TORCH_MLIR_ENABLE_JIT_IR_IMPORTER=0 \
+  TORCH_MLIR_ENABLE_ONLY_MLIR_PYTHON_BINDINGS=1 \
+  python -m pip wheel -v --no-build-isolation -w /wheelhouse /main_checkout/torch-mlir
 }
 
 function clean_wheels() {

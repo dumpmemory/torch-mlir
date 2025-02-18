@@ -1,5 +1,7 @@
 // RUN: torch-mlir-opt %s | torch-mlir-opt | FileCheck %s
 
+// CHECK: #[[$ENCODING:.*]] = #sparse_tensor.encoding<{ map = (d0, d1) -> (d0 : dense, d1 : compressed) }>
+
 // CHECK-LABEL: func.func @torch.operator(
 func.func @torch.operator(%arg0: !torch.tensor, %arg1: !torch.tensor) -> !torch.tensor {
   // CHECK: torch.operator "ns.unqual.overload"(%arg0, %arg1) : (!torch.tensor, !torch.tensor) -> !torch.tensor
@@ -27,6 +29,10 @@ func.func private @tensor.ranked() -> !torch.tensor<[?,?,?],unk>
 func.func private @tensor.some_sizes_known() -> !torch.tensor<[?,2,?,4],unk>
 // CHECK: @tensor.fully_determined() -> !torch.vtensor<[1,2,3,4],f32>
 func.func private @tensor.fully_determined() -> !torch.vtensor<[1,2,3,4],f32>
+
+// CHECK: @tensor.sparse() -> !torch.vtensor<[64,64],f32,#[[$ENCODING]]>
+#CSR = #sparse_tensor.encoding<{ map = (d0, d1) -> (d0 : dense, d1 : compressed) }>
+func.func private @tensor.sparse() -> !torch.vtensor<[64,64],f32,#CSR>
 
 // CHECK: @tuple.empty() -> !torch.tuple<>
 func.func private @tuple.empty() -> !torch.tuple<>
@@ -86,6 +92,9 @@ func.func @torch.prim.If(%arg0: !torch.bool, %arg1: !torch.int) -> !torch.int {
 %int3 = torch.constant.int 3
 // CHECK: %int-3 = torch.constant.int -3
 %int-3 = torch.constant.int -3
+
+// CHECK: %int5 = torch.constant.int 5 {test = "value"}
+%int5 = torch.constant.int 5 {test = "value"}
 
 // CHECK: %float1.000000e00 = torch.constant.float 1.000000e+00
 %float1.000000e00 = torch.constant.float 1.000000e+00
@@ -165,3 +174,34 @@ func.func @number_type_subtypes(%arg0: !torch.tensor, %arg1: !torch.list<int>, %
 
 func.func private @tensor_legal_dtype$torch.qint8() -> !torch.tensor<*,!torch.qint8>
 func.func private @tensor_legal_dtype$torch.quint8() -> !torch.tensor<*,!torch.quint8>
+func.func private @tensor_legal_dtype$torch.qint16() -> !torch.tensor<*,!torch.qint16>
+
+func.func @prim_list_construct$valid_shape_subtype(%arg0: !torch.vtensor<[1,53,56,96],f16>, %arg1: !torch.vtensor<[1,3,56,96],f16>) -> !torch.list<vtensor<[1,?,56,96],f16>> {
+  %arg2 = "torch.prim.ListConstruct"(%arg0, %arg1) : (!torch.vtensor<[1,53,56,96],f16>, !torch.vtensor<[1,3,56,96],f16>) -> !torch.list<vtensor<[1,?,56,96],f16>>
+  return %arg2 : !torch.list<vtensor<[1,?,56,96],f16>>
+}
+
+// Check that verification passes with '-1' as a permutation index.
+func.func @torch.permute$negative_index_valid (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[1,2,3],f32> {
+  %intm1 = torch.constant.int -1
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %perm = torch.prim.ListConstruct %int0, %int1, %intm1 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[1,2,3],f32>
+  return %3 : !torch.vtensor<[1,2,3],f32>
+}
+
+// Check fake quantize ops
+func.func @torch.aten.fake_quantize_per_channel_affine (%arg0: !torch.vtensor<[3,3],f32>, %arg1: !torch.vtensor<[3],f32>, %arg2: !torch.vtensor<[3],si32>) -> !torch.vtensor<[3,3],f32> {
+  %int0 = torch.constant.int 0
+  %int255 = torch.constant.int 255
+  %1 = torch.aten.fake_quantize_per_channel_affine %arg0, %arg1, %arg2, %int0, %int0, %int255 : !torch.vtensor<[3,3],f32>, !torch.vtensor<[3],f32>, !torch.vtensor<[3],si32>, !torch.int, !torch.int, !torch.int -> !torch.vtensor<[3,3],f32>
+  return %1 : !torch.vtensor<[3,3],f32>
+}
+
+func.func @torch.aten.fake_quantize_per_tensor_affine.tensor_qparams (%arg0: !torch.vtensor<[3,3],f32>, %arg1: !torch.vtensor<[3],f32>, %arg2: !torch.vtensor<[3],si32>) -> !torch.vtensor<[3,3],f32> {
+  %int0 = torch.constant.int 0
+  %int255 = torch.constant.int 255
+  %1 = torch.aten.fake_quantize_per_tensor_affine.tensor_qparams %arg0, %arg1, %arg2, %int0, %int255 : !torch.vtensor<[3,3],f32>, !torch.vtensor<[3],f32>, !torch.vtensor<[3],si32>, !torch.int, !torch.int -> !torch.vtensor<[3,3],f32>
+  return %1 : !torch.vtensor<[3,3],f32>
+}

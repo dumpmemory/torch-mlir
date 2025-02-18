@@ -30,14 +30,14 @@ it to various target dialects of interest to the MLIR ecosystem (various
 
 - Linalg-on-Tensors (+ `arith`, `tensor`, etc.)
 - [TOSA](https://mlir.llvm.org/docs/Dialects/TOSA/)
-- [MHLO](https://github.com/tensorflow/mlir-hlo)
+- [StableHLO](https://github.com/openxla/stablehlo)
 
 The terms "frontend" and "backend" are highly overloaded in any compiler
 project, but frequently in Torch-MLIR this is the meaning that they have.
 Sometimes "frontend" can mean something even further up the stack, such as
 something in PyTorch itself. When there is ambiguity we will refer to this as
 "at the PyTorch level". Similarly, "backend" can sometimes refer to something
-sitting below Linalg-on-Tensors, TOSA, or MHLO.
+sitting below Linalg-on-Tensors, TOSA, or StableHLO.
 
 ## The `torch` dialect
 
@@ -55,14 +55,14 @@ factored such that we can handle this with one core import path, which is
 through the PyTorch
 "[JIT IR](https://github.com/pytorch/pytorch/blob/78c8a0d75220bdd4955415b5f81509e005af4232/torch/csrc/jit/OVERVIEW.md)",
 and lives in
-[torch-mlir/python/torch_mlir/dialects/torch/importer/jit_ir](https://github.com/llvm/torch-mlir/tree/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/dialects/torch/importer/jit_ir).
+[torch-mlir/python/torch_mlir/jit_ir_importer](https://github.com/llvm/torch-mlir/tree/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/dialects/torch/importer/jit_ir).
 The JIT IR is a highly principled IR that faithfully models a Python subset (+
 tensors, the PyTorch op registry, and a few other things). All the other PyTorch
 program representations can eventually bottom-out on the JIT IR via some path
 provided by PyTorch. The `torch` dialect is almost entirely in 1:1
 correspondence with the JIT IR -- this allows the importer to be extremely small
 (the core is
-[under 500 lines of code](https://github.com/llvm/torch-mlir/blob/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/dialects/torch/importer/jit_ir/csrc/node_importer.cpp#L1)).
+[under 500 lines of code](https://github.com/llvm/torch-mlir/blob/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/dialects/torch/importer/jit_ir/csrc/node_importer.cpp)).
 
 ### Ops
 
@@ -70,7 +70,7 @@ See [TorchOps.td](https://github.com/llvm/torch-mlir/blob/114f48e96c578ee76a6f83
 
 The ops in the `torch` dialect are almost entirely generated based on the
 PyTorch JIT IR operator registry via the script
-[torch_ods_gen.py](https://github.com/llvm/torch-mlir/blob/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/dialects/torch/importer/jit_ir/build_tools/torch_ods_gen.py#L1) (invoked via [update_torch_ods.sh](https://github.com/llvm/torch-mlir/blob/main/build_tools/update_torch_ods.sh)).
+[torch_ods_gen.py](https://github.com/llvm/torch-mlir/blob/e322f6a8784009b37aa354abfa9a40a80f30877d/python/torch_mlir/jit_ir_importer/build_tools/torch_ods_gen.py#L1) (invoked via [update_torch_ods.sh](https://github.com/llvm/torch-mlir/blob/main/build_tools/update_torch_ods.sh)).
 This script queries the registry and generates MLIR
 [ODS](https://mlir.llvm.org/docs/OpDefinitions/) in
 [GeneratedTorchOps.td](https://github.com/llvm/torch-mlir/blob/e322f6a8784009b37aa354abfa9a40a80f30877d/include/torch-mlir/Dialect/Torch/IR/GeneratedTorchOps.td#L1). We have a guide for [adding a new op end-to-end](https://github.com/llvm/torch-mlir/wiki/Torch-ops-E2E-implementation).
@@ -118,8 +118,8 @@ See [satisfiesBackendContract](https://github.com/llvm/torch-mlir/blob/114f48e96
 
 The backend contract is a normalized form of the `torch` dialect with a set of
 properties that make it easy to lower into various forms such as
-Linalg-on-Tensors, TOSA, MHLO, or other forms that we don't provide out of the
-box. The primary guarantees that we provide Torch-MLIR's backends are:
+Linalg-on-Tensors, TOSA, StableHLO, or other forms that we don't provide out of
+the box. The primary guarantees that we provide Torch-MLIR's backends are:
 
 - All tensors have been converted to value semantics.
 - All tensors have at least a known number of dimensions (i.e. rank), and
@@ -184,7 +184,7 @@ semantics. And often users want to erase the shapes in the trace to allow
 dynamic shapes for the trace. Additionally, the Python-level data structures and
 APIs are very parallel between `torch.jit.script` and `torch.jit.trace`, so we
 consider both of those as the same from the perspective of the responsibilities
-of the compiler. Both are accessed via the `torch_mlir.compile` Python API.
+of the compiler. Both are accessed via the `torch_mlir.torchscript.compile` Python API.
 
 ### Modeling the `torch.nn.Module` object (`IValue`) hierarchy for TorchScript
 
@@ -195,7 +195,7 @@ values. When one `torch.jit.script`'s a `torch.nn.Module`, the result is
 actually an `IValue` that represents the module, with a hierarchy of children
 `IValue`'s. Strictly speaking, JIT IR `torch::jit::Graph`'s are only used to
 represent the bodies of methods on the modules. So in addition to importing the
-JIT IR, we also need to import the `IValue`'s. This happens inside [ivalue_importer.cpp](https://github.com/llvm/torch-mlir/blob/fde390c7669e29362b18388448ef2b188713383f/python/torch_mlir/dialects/torch/importer/jit_ir/csrc/ivalue_importer.cpp#L1).
+JIT IR, we also need to import the `IValue`'s. This happens inside [ivalue_importer.cpp](https://github.com/llvm/torch-mlir/blob/fde390c7669e29362b18388448ef2b188713383f/python/torch_mlir/jit_ir_importer/csrc/ivalue_importer.cpp#L1).
 
 Most of the IValue modeling can reuse `torch` dialect ops that already exist
 otherwise, such as `torch.constant.int` to represent an int in the object graph.
@@ -242,8 +242,7 @@ The `torchscript-module-to-torch-backend-pipeline` contains the set of simplific
 1. LowerToBackendContract: This pass iteratively applies a simplification
    pipeline until the backend contract is reached. The simplification pipeline consists of:
    - Standard canonicalization.
-   - Shape refinement. See [shape_lib.md](https://github.com/llvm/torch-mlir/blob/main/docs/shape_lib.md) for detail
-   - DType refinement. See `RefineTypes`.
+   - Shape and Dtype refinement. See [abstract_interp_lib.md](https://github.com/llvm/torch-mlir/blob/main/docs/abstract_interp_lib.md) for detail
    - Decomposing ops into more primitive ops. See `DecomposeComplexOps`.
 
 ### Layering of the PyTorch Dependency
@@ -270,7 +269,7 @@ lower it to the requirements of each backend. The 3 backends are:
 - [`linalg`](https://mlir.llvm.org/docs/Dialects/Linalg/) on tensors (+ `arith`,
   `tensor`, etc.)
 - [TOSA](https://mlir.llvm.org/docs/Dialects/TOSA/)
-- [MHLO](https://github.com/tensorflow/mlir-hlo)
+- [StableHLO](https://github.com/openxla/stablehlo)
 
 ### The Linalg Backend (Linalg-on-Tensors)
 
@@ -297,15 +296,15 @@ many users (especially "hardware" or "hardware-adjacent" folks). Some of its cha
 - It is extremely solid with static shapes (and many of its users only care
   about static shapes, so that's fine).
 
-### The MHLO Backend
+### The StableHLO Backend
 
-Code: https://github.com/llvm/torch-mlir/tree/main/lib/Conversion/TorchToMhlo
+Code: https://github.com/llvm/torch-mlir/tree/main/lib/Conversion/TorchToStablehlo
 
-The MHLO backend was the third backend that we added, and it offers a reasonable
-blend of the benefits of the other two.
+The StableHLO backend was the third backend that we added, and it offers a
+reasonable blend of the benefits of the other two.
 - It is a coarse-grained named-op approach.
 - It has a pretty clear spec for most of the ops (with a bit of mental
-  translation and hoping that MHLO is the same as HLO):
+  translation and hoping that StableHLO is the same as HLO):
   https://www.tensorflow.org/xla/operation_semantics
 - It functionally supports dynamic shapes (though not as coherent and consistent
   as Linalg-on-Tensors, and the dynamic shape support falls outside the
@@ -317,7 +316,7 @@ blend of the benefits of the other two.
   example, TOSA limits (for highly considered reasons) the number of dimensions
   that certain operators can handle to 1D-4D, when from a purely algebraic
   perspective there isn't a good reason to not be more general. Similarly, more
-  general forms of reduction and scatter also fall into MHLO nicely while
+  general forms of reduction and scatter also fall into StableHLO nicely while
   TOSA's principles tend to bias it away from that.
 
 ### Backend Implementation
@@ -414,8 +413,6 @@ DON'T use a unit test if your lowering pattern could be described as a trivial
 like your unit test is just rewriting `b.create<...>(...)` into `CHECK: ...`
 then it is probably not a useful unit test.
 
-DON'T add a unit test for trivial changes to RefineTypes.
-
 With the exceptions above, all changes should include appropriate unit tests, as
 is standard in the LLVM and MLIR community. This includes full coverage of all
 canonicalizations, pretty printing, passes, errors, and diagnostics.
@@ -433,8 +430,9 @@ filling in some corners missing upstream and
 to pull together upstream functionality into a working system.
 
 The RefBackend accepts Linalg-on-Tensors as input. It mainly just bufferizes the
-ops and lowers them to loops. Note that TOSA and MHLO support lowering to
-Linalg-on-Tensors, so all our end-to-end testing bottoms out on RefBackend.
+ops and lowers them to loops. Note that TOSA and StableHLO (via MHLO) support
+lowering to Linalg-on-Tensors, so all our end-to-end testing bottoms out on
+RefBackend.
 
 The RefBackend is absolutely not suitable for any production use case. It leaks
 memory, doesn't support any error handling, performs no optimizations, and
@@ -444,5 +442,5 @@ characteristics.
 
 ### Presentations and Talks
 
-* 2021-10-07: MLIR ODM: Introduction to Torch-MLIR. ([recording](https://www.youtube.com/watch?v=QbNkex-gizs) and [slides](https://docs.google.com/presentation/d/1ZhzfE4EK6XV7AdQTYicrsE_OYjkER_yiB0vBeszRfzY/edit#slide=id.gf56404f79c_1_55)) 
-* 2022-08-20: Overview of Torch-MLIR passes. ([recording](https://www.youtube.com/watch?v=ZpwlVxsD9_U) and [slides](https://drive.google.com/file/d/1ZSlk1HGttRuVhJSxtP6spWt_hxClit2T/view)) 
+* 2021-10-07: MLIR ODM: Introduction to Torch-MLIR. ([recording](https://www.youtube.com/watch?v=QbNkex-gizs) and [slides](https://docs.google.com/presentation/d/1ZhzfE4EK6XV7AdQTYicrsE_OYjkER_yiB0vBeszRfzY/edit#slide=id.gf56404f79c_1_55))
+* 2022-08-20: Overview of Torch-MLIR passes. ([recording](https://www.youtube.com/watch?v=ZpwlVxsD9_U) and [slides](https://drive.google.com/file/d/1ZSlk1HGttRuVhJSxtP6spWt_hxClit2T/view))

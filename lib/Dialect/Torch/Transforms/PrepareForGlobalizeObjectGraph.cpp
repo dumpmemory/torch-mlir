@@ -9,13 +9,9 @@
 
 #include "PassDetail.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BlockAndValueMapping.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 
@@ -31,7 +27,7 @@ public:
   LogicalResult matchAndRewrite(PrimCallMethodOp op,
                                 PatternRewriter &rewriter) const override {
     auto classType = symbolTable.lookup<ClassTypeOp>(
-        op.getReceiver().getType().cast<NnModuleType>().getClassName());
+        cast<NnModuleType>(op.getReceiver().getType()).getClassName());
     assert(classType && "malformed module -- missing ClassTypeOp");
     func::FuncOp func;
     for (auto method : classType.getOps<MethodOp>()) {
@@ -79,14 +75,13 @@ class PrepareForGlobalizeObjectGraphPass
     func::CallIndirectOp::getCanonicalizationPatterns(patterns, context);
     patterns.add<EraseUnusedConstantOp>(context);
 
-    // Use applyPatternsAndFoldGreedily because the CallIndirectOp folding
+    // Use applyPatternsGreedily because the CallIndirectOp folding
     // makes the ConstantOp unused, which does not work with the visitation
     // order of the dialect conversion infrastructure.
     // TODO: Do this with the dialect conversion infrastructure to avoid doing
     // folding as part of this. Or avoid folding during greedy pattern
     // application. See: https://llvm.org/PR49502
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
 
@@ -95,7 +90,7 @@ class PrepareForGlobalizeObjectGraphPass
     ConversionTarget target(*context);
     target.addIllegalOp<PrimCallMethodOp>();
     target.addDynamicallyLegalOp<func::ConstantOp>(
-        [](func::ConstantOp op) { return !op.getType().isa<FunctionType>(); });
+        [](func::ConstantOp op) { return !isa<FunctionType>(op.getType()); });
     target.addIllegalOp<func::CallIndirectOp>();
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
 

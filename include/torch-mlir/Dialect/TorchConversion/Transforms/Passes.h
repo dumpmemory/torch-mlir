@@ -10,7 +10,7 @@
 #ifndef TORCHMLIR_DIALECT_TORCHCONVERSION_TRANSFORMS_PASSES_H
 #define TORCHMLIR_DIALECT_TORCHCONVERSION_TRANSFORMS_PASSES_H
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 
@@ -26,14 +26,19 @@ namespace TorchConversion {
 /// linalg-on-tensors backend contract.
 void createTorchBackendToLinalgOnTensorsBackendPipeline(OpPassManager &pm);
 
+// Do not register the TOSA options if the TOSA target is disabled
+#ifdef TORCH_MLIR_ENABLE_TOSA
 /// Creates a pipeline that lowers from the torch backend contract to the
 /// TOSA backend contract.
 void createTorchBackendToTosaBackendPipeline(OpPassManager &pm);
 
-// Do not register the torch-to-mhlo pipeline if mhlo target is disabled
-#ifdef TORCH_MLIR_ENABLE_MHLO
-struct MhloBackendPipelineOptions
-    : public PassPipelineOptions<MhloBackendPipelineOptions> {
+std::unique_ptr<OperationPass<ModuleOp>> createVerifyTosaBackendContractPass();
+#endif // TORCH_MLIR_ENABLE_TOSA
+
+// Do not register the stablehlo options if the stablehlo target is disabled
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+struct StablehloBackendPipelineOptions
+    : public PassPipelineOptions<StablehloBackendPipelineOptions> {
   Option<bool> enableStaticShape{
       *this, "enable-static-shape",
       llvm::cl::desc("Enable static shape conversion."), llvm::cl::init(false)};
@@ -46,20 +51,36 @@ struct MhloBackendPipelineOptions
       llvm::cl::init(false)};
 };
 
-void createTorchBackendToMhloBackendPipeline(
-    OpPassManager &pm, const MhloBackendPipelineOptions &options);
-std::unique_ptr<OperationPass<ModuleOp>> createVerifyMhloBackendContractPass();
-#endif
+void createTorchBackendToStablehloBackendPipeline(
+    OpPassManager &pm, const StablehloBackendPipelineOptions &options);
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createFuncBackendTypeConversionForStablehloPass();
+
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createFinalizingBackendTypeConversionForStablehloPass();
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createVerifyStablehloBackendContractPass();
+#endif // TORCH_MLIR_ENABLE_STABLEHLO
 
 std::unique_ptr<OperationPass<ModuleOp>> createFuncBackendTypeConversionPass();
 
-std::unique_ptr<OperationPass<func::FuncOp>>
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createFinalizingBackendTypeConversionPass();
+
+// These passes do a one-off conversion of a specific kind of quantized group
+// matmul as a prototype. Generalized quantized operation handling will likely
+// obviate them but that are being carried for now in order to unblock progress
+// on full integrations. See https://github.com/llvm/torch-mlir/issues/2417 for
+// the plan to support a more generalized lowering for these graphs.
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createUnpackQuantTensorPass();
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createConvertCustomQuantOpPass();
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createVerifyLinalgOnTensorsBackendContractPass();
-
-std::unique_ptr<OperationPass<ModuleOp>> createVerifyTosaBackendContractPass();
 
 } // namespace TorchConversion
 

@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/BackendTypeConversion.h"
+#include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -23,27 +23,28 @@ void mlir::torch::TorchConversion::getBackendTypeConversionDependentDialects(
 // Type conversion setup.
 //===----------------------------------------------------------------------===//
 
-static void
-setupValueTensorToBuiltinTensorConversion(ConversionTarget &target,
-                                          TypeConverter &typeConverter) {
+using ValueTensorTypeConversionFn =
+    std::function<std::optional<Type>(Torch::ValueTensorType)>;
+
+static void setupValueTensorToBuiltinTensorConversion(
+    ConversionTarget &target, TypeConverter &typeConverter,
+    const ValueTensorTypeConversionFn &conversionFn) {
   target.addLegalOp<TorchConversion::ToBuiltinTensorOp,
                     TorchConversion::FromBuiltinTensorOp>();
-  typeConverter.addConversion(
-      [](Torch::ValueTensorType type) -> Optional<Type> {
-        return type.toBuiltinTensor();
-      });
+  typeConverter.addConversion(conversionFn);
   typeConverter.addTargetMaterialization([](OpBuilder &builder, TensorType type,
                                             ValueRange inputs,
                                             Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<Torch::BaseTensorType>());
-    return builder.create<ToBuiltinTensorOp>(loc, inputs[0]);
+    if (!isa<Torch::BaseTensorType>(inputs[0].getType()))
+      return {};
+    return builder.create<ToBuiltinTensorOp>(loc, type, inputs[0]);
   });
   auto sourceMaterialization = [](OpBuilder &builder,
                                   Torch::ValueTensorType type,
                                   ValueRange inputs, Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<TensorType>());
+    assert(isa<TensorType>(inputs[0].getType()));
     return builder.create<FromBuiltinTensorOp>(loc, type, inputs[0]);
   };
   typeConverter.addSourceMaterialization(sourceMaterialization);
@@ -53,23 +54,23 @@ setupValueTensorToBuiltinTensorConversion(ConversionTarget &target,
 static void setupTorchBoolToI1Conversion(ConversionTarget &target,
                                          TypeConverter &typeConverter) {
   target.addLegalOp<TorchConversion::ToI1Op, TorchConversion::FromI1Op>();
-  typeConverter.addConversion([](Torch::BoolType type) -> Optional<Type> {
+  typeConverter.addConversion([](Torch::BoolType type) -> std::optional<Type> {
     return IntegerType::get(type.getContext(), 1);
   });
   typeConverter.addTargetMaterialization([](OpBuilder &builder,
                                             IntegerType type, ValueRange inputs,
-                                            Location loc) -> Optional<Value> {
+                                            Location loc) -> Value {
     // Other builtin integer types could be handled by other materializers.
     if (!(type.getWidth() == 1 && type.isSignless()))
-      return std::nullopt;
+      return Value();
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<Torch::BoolType>());
+    assert(isa<Torch::BoolType>(inputs[0].getType()));
     return builder.create<ToI1Op>(loc, inputs[0]).getResult();
   });
   auto sourceMaterialization = [](OpBuilder &builder, Torch::BoolType type,
                                   ValueRange inputs, Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<IntegerType>());
+    assert(isa<IntegerType>(inputs[0].getType()));
     return builder.create<FromI1Op>(loc, inputs[0]);
   };
   typeConverter.addSourceMaterialization(sourceMaterialization);
@@ -79,26 +80,26 @@ static void setupTorchBoolToI1Conversion(ConversionTarget &target,
 static void setupTorchIntToI64Conversion(ConversionTarget &target,
                                          TypeConverter &typeConverter) {
   target.addLegalOp<TorchConversion::ToI64Op, TorchConversion::FromI64Op>();
-  typeConverter.addConversion([](Torch::IntType type) -> Optional<Type> {
+  typeConverter.addConversion([](Torch::IntType type) -> std::optional<Type> {
     return IntegerType::get(type.getContext(), 64);
   });
   typeConverter.addTargetMaterialization([](OpBuilder &builder,
                                             IntegerType type, ValueRange inputs,
-                                            Location loc) -> Optional<Value> {
+                                            Location loc) -> Value {
     // Other builtin integer types could be handled by other materializers.
     if (!(type.getWidth() == 64 && type.isSignless()))
-      return std::nullopt;
+      return Value();
     // Other input type to be converted to i64 are handled by other
     // materializers.
-    if (!inputs[0].getType().isa<Torch::IntType>())
-      return std::nullopt;
+    if (!isa<Torch::IntType>(inputs[0].getType()))
+      return Value();
     assert(inputs.size() == 1);
-    return builder.create<ToI64Op>(loc, inputs[0]).getResult();
+    return builder.createOrFold<ToI64Op>(loc, inputs[0]);
   });
   auto sourceMaterialization = [](OpBuilder &builder, Torch::IntType type,
                                   ValueRange inputs, Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<IntegerType>());
+    assert(isa<IntegerType>(inputs[0].getType()));
     return builder.create<FromI64Op>(loc, inputs[0]);
   };
   typeConverter.addSourceMaterialization(sourceMaterialization);
@@ -108,20 +109,20 @@ static void setupTorchIntToI64Conversion(ConversionTarget &target,
 static void setupTorchFloatToF64Conversion(ConversionTarget &target,
                                            TypeConverter &typeConverter) {
   target.addLegalOp<TorchConversion::ToF64Op, TorchConversion::FromF64Op>();
-  typeConverter.addConversion([](Torch::FloatType type) -> Optional<Type> {
+  typeConverter.addConversion([](Torch::FloatType type) -> std::optional<Type> {
     return Float64Type::get(type.getContext());
   });
   typeConverter.addTargetMaterialization([](OpBuilder &builder,
                                             Float64Type type, ValueRange inputs,
-                                            Location loc) -> Optional<Value> {
+                                            Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<Torch::FloatType>());
+    assert(isa<Torch::FloatType>(inputs[0].getType()));
     return builder.create<ToF64Op>(loc, inputs[0]).getResult();
   });
   auto sourceMaterialization = [](OpBuilder &builder, Torch::FloatType type,
                                   ValueRange inputs, Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<Float64Type>());
+    assert(isa<Float64Type>(inputs[0].getType()));
     return builder.create<FromF64Op>(loc, inputs[0]);
   };
   typeConverter.addSourceMaterialization(sourceMaterialization);
@@ -132,26 +133,27 @@ static void setupTorchGeneratorToI64Conversion(ConversionTarget &target,
                                                TypeConverter &typeConverter) {
   target.addLegalOp<TorchConversion::GeneratorToI64Op,
                     TorchConversion::I64ToGeneratorOp>();
-  typeConverter.addConversion([](Torch::GeneratorType type) -> Optional<Type> {
-    return IntegerType::get(type.getContext(), 64);
-  });
+  typeConverter.addConversion(
+      [](Torch::GeneratorType type) -> std::optional<Type> {
+        return IntegerType::get(type.getContext(), 64);
+      });
   typeConverter.addTargetMaterialization([](OpBuilder &builder,
                                             IntegerType type, ValueRange inputs,
-                                            Location loc) -> Optional<Value> {
+                                            Location loc) -> Value {
     // Other builtin integer types could be handled by other materializers.
     if (!(type.getWidth() == 64 && type.isSignless()))
-      return std::nullopt;
+      return Value();
     // Other input type to be converted to i64 are handled by other
     // materializers.
-    if (!inputs[0].getType().isa<Torch::GeneratorType>())
-      return std::nullopt;
+    if (!isa<Torch::GeneratorType>(inputs[0].getType()))
+      return Value();
     assert(inputs.size() == 1);
     return builder.create<GeneratorToI64Op>(loc, inputs[0]).getResult();
   });
   auto sourceMaterialization = [](OpBuilder &builder, Torch::GeneratorType type,
                                   ValueRange inputs, Location loc) -> Value {
     assert(inputs.size() == 1);
-    assert(inputs[0].getType().isa<IntegerType>());
+    assert(isa<IntegerType>(inputs[0].getType()));
     return builder.create<I64ToGeneratorOp>(loc, inputs[0]);
   };
   typeConverter.addSourceMaterialization(sourceMaterialization);
@@ -160,9 +162,54 @@ static void setupTorchGeneratorToI64Conversion(ConversionTarget &target,
 
 void mlir::torch::TorchConversion::setupBackendTypeConversion(
     ConversionTarget &target, TypeConverter &typeConverter) {
-  setupValueTensorToBuiltinTensorConversion(target, typeConverter);
+  auto valueTensorTypeConversion =
+      [](Torch::ValueTensorType type) -> std::optional<Type> {
+    auto builtinType = type.toBuiltinTensor();
+    if (!builtinType)
+      return std::nullopt;
+
+    // convert any integer type to signless
+    if (type.getDtype().isInteger()) {
+      return builtinType.clone(IntegerType::get(
+          builtinType.getContext(), type.getDtype().getIntOrFloatBitWidth(),
+          IntegerType::Signless));
+    }
+
+    return builtinType;
+  };
+  setupValueTensorToBuiltinTensorConversion(target, typeConverter,
+                                            valueTensorTypeConversion);
   setupTorchBoolToI1Conversion(target, typeConverter);
   setupTorchIntToI64Conversion(target, typeConverter);
   setupTorchFloatToF64Conversion(target, typeConverter);
   setupTorchGeneratorToI64Conversion(target, typeConverter);
 }
+
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+void mlir::torch::TorchConversion::setupBackendTypeConversionForStablehlo(
+    ConversionTarget &target, TypeConverter &typeConverter) {
+  auto valueTensorTypeConversion =
+      [](Torch::ValueTensorType type) -> std::optional<Type> {
+    auto builtinType = type.toBuiltinTensor();
+    if (!builtinType)
+      return std::nullopt;
+
+    // convert signed integer type to signless, keep unsigned as unsigned
+    if (type.getDtype().isUnsignedInteger()) {
+      return builtinType.clone(type.getDtype());
+    } else if (type.getDtype().isSignedInteger()) {
+      return builtinType.clone(IntegerType::get(
+          builtinType.getContext(), type.getDtype().getIntOrFloatBitWidth(),
+          IntegerType::Signless));
+    }
+
+    return builtinType;
+  };
+  setupValueTensorToBuiltinTensorConversion(target, typeConverter,
+                                            valueTensorTypeConversion);
+  setupTorchBoolToI1Conversion(target, typeConverter);
+  setupTorchIntToI64Conversion(target, typeConverter);
+  setupTorchFloatToF64Conversion(target, typeConverter);
+  setupTorchGeneratorToI64Conversion(target, typeConverter);
+}
+#endif

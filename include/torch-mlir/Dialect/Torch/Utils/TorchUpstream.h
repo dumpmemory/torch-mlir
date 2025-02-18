@@ -9,6 +9,7 @@
 #define TORCHMLIR_DIALECT_TORCH_UPSTREAM_H
 
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/StringRef.h"
 
 // For layering reasons, the parts of the core MLIR compiler code written in C++
 // never take a C++ dependency on Torch itself (any code depending on Torch C++
@@ -85,24 +86,34 @@ enum class TypeKind {
 // at:: and c10:: parts of the macro are never used within the compiler -- we
 // only use this for the enum values.
 #define AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(_)                       \
-  _(uint8_t, Byte)                        /* 0 */                              \
-  _(int8_t, Char)                         /* 1 */                              \
-  _(int16_t, Short)                       /* 2 */                              \
-  _(int, Int)                             /* 3 */                              \
-  _(int64_t, Long)                        /* 4 */                              \
-  _(at::Half, Half)                       /* 5 */                              \
-  _(float, Float)                         /* 6 */                              \
-  _(double, Double)                       /* 7 */                              \
-  _(c10::complex<c10::Half>, ComplexHalf) /* 8 */                              \
-  _(c10::complex<float>, ComplexFloat)    /* 9 */                              \
-  _(c10::complex<double>, ComplexDouble)  /* 10 */                             \
-  _(bool, Bool)                           /* 11 */                             \
-  _(c10::qint8, QInt8)                    /* 12 */                             \
-  _(c10::quint8, QUInt8)                  /* 13 */                             \
-  _(c10::qint32, QInt32)                  /* 14 */                             \
-  _(at::BFloat16, BFloat16)               /* 15 */                             \
-  _(c10::quint4x2, QUInt4x2)              /* 16 */                             \
-  _(c10::quint2x4, QUInt2x4)              /* 17 */
+  _(uint8_t, Byte)                         /* 0 */                             \
+  _(int8_t, Char)                          /* 1 */                             \
+  _(int16_t, Short)                        /* 2 */                             \
+  _(int, Int)                              /* 3 */                             \
+  _(int64_t, Long)                         /* 4 */                             \
+  _(at::Half, Half)                        /* 5 */                             \
+  _(float, Float)                          /* 6 */                             \
+  _(double, Double)                        /* 7 */                             \
+  _(c10::complex<c10::Half>, ComplexHalf)  /* 8 */                             \
+  _(c10::complex<float>, ComplexFloat)     /* 9 */                             \
+  _(c10::complex<double>, ComplexDouble)   /* 10 */                            \
+  _(bool, Bool)                            /* 11 */                            \
+  _(c10::qint8, QInt8)                     /* 12 */                            \
+  _(c10::quint8, QUInt8)                   /* 13 */                            \
+  _(c10::qint32, QInt32)                   /* 14 */                            \
+  _(at::BFloat16, BFloat16)                /* 15 */                            \
+  _(c10::quint4x2, QUInt4x2)               /* 16 */                            \
+  _(c10::quint2x4, QUInt2x4)               /* 17 */                            \
+  _(c10::bits1x8, Bits1x8)                 /* 18 */                            \
+  _(c10::bits2x4, Bits2x4)                 /* 19 */                            \
+  _(c10::bits4x2, Bits4x2)                 /* 20 */                            \
+  _(c10::bits8, Bits8)                     /* 21 */                            \
+  _(c10::bits16, Bits16)                   /* 22 */                            \
+  _(c10::Float8_e5m2, Float8_e5m2)         /* 23 */                            \
+  _(c10::Float8_e4m3fn, Float8_e4m3fn)     /* 24 */                            \
+  _(c10::Float8_e5m2fnuz, Float8_e5m2fnuz) /* 25 */                            \
+  _(c10::Float8_e4m3fnuz, Float8_e4m3fnuz) /* 26 */                            \
+  _(c10::qint16, QInt16)                   /* 27 */
 
 enum class ScalarType : int8_t {
 #define DEFINE_ENUM(_1, n) n,
@@ -134,17 +145,14 @@ ScalarType promote_skip_undefined(ScalarType a, ScalarType b);
 //===----------------------------------------------------------------------===//
 enum Reduction { None, Mean, Sum, END };
 
+Reduction get_loss_reduction_enum(const llvm::StringRef &reduce);
+
 //===----------------------------------------------------------------------===//
 // Possible values for `memory_format` argument in PyTorch ops that support it.
 // Source:
 // https://github.com/pytorch/pytorch/blob/master/c10/core/MemoryFormat.h
 //===----------------------------------------------------------------------===//
-enum MemoryFormat {
-  Contiguous,
-  Preserve,
-  ChannelsLast,
-  ChannelsLast3d
-};
+enum MemoryFormat { Contiguous, Preserve, ChannelsLast, ChannelsLast3d };
 
 //===----------------------------------------------------------------------===//
 // Possible values for `layout` argument in PyTorch ops that support it.
@@ -159,6 +167,15 @@ enum Layout { Strided, Sparse, SparseCsr, Mkldnn, NumOptions };
 // https://github.com/llvm/torch-mlir/blob/main/include/torch-mlir/Dialect/Torch/Utils/TorchUpstream.h
 //===-----------------------------------------------------------------------===//
 enum EmbeddingBagMode { MODE_SUM, MODE_MEAN, MODE_MAX };
+
+//===----------------------------------------------------------------------===//
+// Possible value for `reduce` argument for Scatter reduce ops.
+// Source:
+// https://github.com/llvm/torch-mlir/blob/main/include/torch-mlir/Dialect/Torch/Utils/TorchUpstream.h
+//===-----------------------------------------------------------------------===//
+enum ReductionType { MAX, MEAN, MIN, SUM, PROD };
+
+ReductionType get_reduction_enum(const llvm::StringRef &reduce);
 
 } // namespace torch_upstream
 } // namespace torch

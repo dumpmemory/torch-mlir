@@ -1,4 +1,4 @@
-# The Torch-MLIR Project 
+# The Torch-MLIR Project
 
 The Torch-MLIR project aims to provide first class compiler support from the [PyTorch](https://pytorch.org) ecosystem to the MLIR ecosystem.
 
@@ -8,77 +8,77 @@ necessarily a reflection of the completeness or stability of the code, it
 does indicate that the project is not yet endorsed as a component of LLVM.
 
 [PyTorch](https://pytorch.org)
-An open source machine learning framework that accelerates the path from research prototyping to production deployment.
+PyTorch is an open source machine learning framework that facilitates the seamless transition from research and prototyping to production-level deployment.
 
 [MLIR](https://mlir.llvm.org)
-The MLIR project is a novel approach to building reusable and extensible compiler infrastructure. MLIR aims to address software fragmentation, improve compilation for heterogeneous hardware, significantly reduce the cost of building domain specific compilers, and aid in connecting existing compilers together.
+The MLIR project offers a novel approach for building extensible and reusable compiler architectures, which address the issue of software fragmentation, reduce the cost of developing domain-specific compilers, improve compilation for heterogeneous hardware, and promote compatibility between existing compilers.
 
 [Torch-MLIR](https://github.com/llvm/torch-mlir)
-Multiple Vendors use MLIR as the middle layer, mapping from platform frameworks like PyTorch, JAX, and TensorFlow into MLIR and then progressively lowering down to their target hardware. We have seen half a dozen custom lowerings from PyTorch to MLIR. Having canonical lowerings from the PyTorch ecosystem to the MLIR ecosystem provides much needed relief to hardware vendors to focus on their unique value rather than implementing yet another PyTorch frontend for MLIR. The goal is to be similar to current hardware vendors adding LLVM target support instead of each one also implementing Clang / a C++ frontend.
+Several vendors have adopted MLIR as the middle layer in their systems, enabling them to map frameworks such as PyTorch, JAX, and TensorFlow into MLIR and subsequently lower them to their target hardware. We have observed half a dozen custom lowerings from PyTorch to MLIR, making it easier for hardware vendors to focus on their unique value, rather than needing to implement yet another PyTorch frontend for MLIR. The ultimate aim is to be similar to the current hardware vendors adding LLVM target support, rather than each one implementing Clang or a C++ frontend.
 
-[![Release Build](https://github.com/llvm/torch-mlir/actions/workflows/buildRelease.yml/badge.svg)](https://github.com/llvm/torch-mlir/actions/workflows/buildRelease.yml)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 
 ## All the roads from PyTorch to Torch MLIR Dialect
 
 We have few paths to lower down to the Torch MLIR Dialect.
-
-![Simplified Architecture Diagram for README](docs/images/readme_architecture_diagram.png)
-
- - TorchScript
-    This is the most tested path down to Torch MLIR Dialect.
- - LazyTensorCore
-    Read more details [here](docs/ltc_backend.md).
- - We also have basic TorchDynamo/PyTorch 2.0 support, see our
-   [long-term roadmap](docs/long_term_roadmap.md) and
-   [Thoughts on PyTorch 2.0](https://discourse.llvm.org/t/thoughts-on-pytorch-2-0/67000/3)
-   for more details.
+ - ONNX as the entry points.
+ - Fx as the entry points
 
 ## Project Communication
 
 - `#torch-mlir` channel on the LLVM [Discord](https://discord.gg/xS7Z362) - this is the most active communication channel
 - Github issues [here](https://github.com/llvm/torch-mlir/issues)
 - [`torch-mlir` section](https://llvm.discourse.group/c/projects-that-want-to-become-official-llvm-projects/torch-mlir/41) of LLVM Discourse
-- Weekly meetings on Mondays 9AM PST. See [here](https://discourse.llvm.org/t/community-meeting-developer-hour-refactoring-recurring-meetings/62575) for more information.
-- Weekly op office hours on Thursdays 8:30-9:30AM PST. See [here](https://discourse.llvm.org/t/announcing-torch-mlir-office-hours/63973/2) for more information.
 
 ## Install torch-mlir snapshot
 
-This installs a pre-built snapshot of torch-mlir for Python 3.7/3.8/3.9/3.10 on Linux and macOS.
+At the time of writing, we release [pre-built snapshots of torch-mlir](https://github.com/llvm/torch-mlir-release) for Python 3.11 and Python 3.10.
 
+If you have supported Python version, the following commands initialize a virtual environment.
 ```shell
-python -m venv mlir_venv
+python3.11 -m venv mlir_venv
 source mlir_venv/bin/activate
-# Some older pip installs may not be able to handle the recent PyTorch deps
-python -m pip install --upgrade pip
-pip install --pre torch-mlir torchvision -f https://llvm.github.io/torch-mlir/package-index/ --extra-index-url https://download.pytorch.org/whl/nightly/cpu
-# This will install the corresponding torch and torchvision nightlies
 ```
 
-## Demos
+Or, if you want to switch over multiple versions of Python using conda, you can create a conda environment with Python 3.11.
+```shell
+conda create -n torch-mlir python=3.11
+conda activate torch-mlir
+python -m pip install --upgrade pip
+```
 
-### TorchScript ResNet18 
+Then, we can install torch-mlir with the corresponding torch and torchvision nightlies.
+```
+pip install --pre torch-mlir torchvision \
+  --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
+  -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
+```
 
-Standalone script to Convert a PyTorch ResNet18 model to MLIR and run it on the CPU Backend:
+## Using torch-mlir
 
+Torch-MLIR is primarily a project that is integrated into compilers to bridge them to PyTorch and ONNX. If contemplating a new integration, it may be helpful to refer to existing downstreams:
+
+* [IREE](https://github.com/iree-org/iree.git)
+* [Blade](https://github.com/alibaba/BladeDISC)
+
+While most of the project is exercised via testing paths, there are some ways that an end user can directly use the APIs without further integration:
+
+### FxImporter ResNet18
 ```shell
 # Get the latest example if you haven't checked out the code
-wget https://raw.githubusercontent.com/llvm/torch-mlir/main/examples/torchscript_resnet18.py
+wget https://raw.githubusercontent.com/llvm/torch-mlir/main/projects/pt1/examples/fximporter_resnet18.py
 
 # Run ResNet18 as a standalone script.
-python examples/torchscript_resnet18.py
+python projects/pt1/examples/fximporter_resnet18.py
 
+# Output
 load image from https://upload.wikimedia.org/wikipedia/commons/2/26/YellowLabradorLooking_new.jpg
-Downloading: "https://download.pytorch.org/models/resnet18-f37072fd.pth" to /home/mlir/.cache/torch/hub/checkpoints/resnet18-f37072fd.pth
-100.0%
+...
 PyTorch prediction
-[('Labrador retriever', 70.66319274902344), ('golden retriever', 4.956596374511719), ('Chesapeake Bay retriever', 4.195662975311279)]
+[('Labrador retriever', 70.65674591064453), ('golden retriever', 4.988346099853516), ('Saluki, gazelle hound', 4.477451324462891)]
 torch-mlir prediction
-[('Labrador retriever', 70.66320037841797), ('golden retriever', 4.956601619720459), ('Chesapeake Bay retriever', 4.195651531219482)]
+[('Labrador retriever', 70.6567153930664), ('golden retriever', 4.988325119018555), ('Saluki, gazelle hound', 4.477458477020264)]
 ```
-
-### Lazy Tensor Core
-
-View examples [here](docs/ltc_examples.md).
 
 ## Repository Layout
 

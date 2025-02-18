@@ -56,7 +56,7 @@ def GlobalizeObjectGraph : Pass<"torch-globalize-object-graph", "ModuleOp"> {
     - Multiple instances of the same class type are allowed, as long as it is
       possible to monomorphize ("template instantiate") functions so that each
       argument of !torch.nn.Module type corresponds to a unique instance.
-      In pratice, this limitation is either 1) (fundamental) due to truly
+      In practice, this limitation is either 1) (fundamental) due to truly
       dynamic use of modules, such as `m1 if cond() else m2` in Python code,
       or 2) (incidental) imprecision of the static analysis used in this pass
       which is used to calculate when a single intance is relevant. In general,
@@ -126,15 +126,6 @@ def AdjustCallingConventions
   }];
 }
 
-def RefineTypes : Pass<"torch-refine-types", "func::FuncOp"> {
-  let summary = "Refine types";
-  let constructor = "mlir::torch::Torch::createRefineTypesPass()";
-  let description = [{
-    Refines types of the program. Currently, this means shapes and dtypes of
-    tensors/arrays.
-  }];
-}
-
 def InlineGlobalSlots : Pass<"torch-inline-global-slots", "ModuleOp"> {
   let summary = "Inlines torch.global_slot ops.";
   let constructor = "mlir::torch::Torch::createInlineGlobalSlotsPass()";
@@ -151,7 +142,13 @@ def InlineGlobalSlots : Pass<"torch-inline-global-slots", "ModuleOp"> {
 
 def ReduceOpVariants : Pass<"torch-reduce-op-variants", "func::FuncOp"> {
   let summary = "Reduces variants of ops to a smaller set of ops.";
-  let constructor = "mlir::torch::Torch::createReduceOpVariantsPass()";
+  let constructor = [{
+    mlir::torch::Torch::createReduceOpVariantsPass(/*extraLibrary=*/"")
+  }];
+  let options = [
+    Option<"extraLibrary", "extra-library", "std::string", /*default=*/"",
+           "MLIR module for verifying custom op value semantics">,
+  ];
   let description = [{
     Replaces ops with other ops to reduce the number of variants that
     need to be handled elsewhere in the code.
@@ -238,9 +235,77 @@ def DecomposeComplexOps : Pass<"torch-decompose-complex-ops", "func::FuncOp"> {
   }];
 }
 
+def ScalarizeShapes : Pass<"torch-scalarize-shapes", "func::FuncOp"> {
+  let summary = "Takes common shape computation operations and scalarizes them.";
+  let constructor = "mlir::torch::Torch::createScalarizeShapesPass()";
+  let description = [{
+    Scalarizes shape computations to better propagate static shapes. As some
+    shape operation happen on tensors a single dynamic dimension can prevent
+    propagating static shapes. Scalarization prevents these dynamic
+    dimensions from blocking the statically computable operations.
+  }];
+}
+
+def RecomposeComplexOps : Pass<"torch-recompose-complex-ops", "func::FuncOp"> {
+  let summary = "Recompose torch operations that have been decomposed by TorchScript";
+  let constructor = "mlir::torch::Torch::createRecomposeComplexOpsPass()";
+  let description = [{
+    There are certain ops that TorchScript will split into multiple ops that
+    prevent optimizations in Torch-MLIR from taking place. In this pass such
+    sequences of ops are identified and combined into a higher level op,
+    preserving the original behavior, while allowing new optimizations to happen.
+
+    An example is the handling of the indexing operation in PyTorch. The following
+
+    ```
+    input_tensor[1:2, :] = 7
+    ```
+
+    will get split into a series of `slice` ops to get the sub-tensor, then an
+    in-place copy to overwrite the sub-tensor with the value 7. This type of
+    pattern prevents the `MaximizeValueSemantics` pass from succeeding. So,
+    using `RecomposeComplexOps`, the series of slices + copy is identified
+    and turned into a single `index_put` operation.
+  }];
+}
+
+def FuseQuantizedOps : Pass<"torch-fuse-quantized-ops", "func::FuncOp"> {
+  let summary = "QDQ: Fuse recognized QDQ op sequences.";
+  let constructor = "mlir::torch::Torch::createFuseQuantizedOpsPass()";
+  let description = [{
+    Torch models often represents quantized operations as the sequence:
+      Dequantize
+      DenseOp
+      Quantize
+    This allows the existing dense operations to be used without specifically
+    representing quantized types. It is more computationally efficient to
+    perform the dense operation in the quantized domain, so we fuse the
+    quantization / dequantization behavior together and represent as purely
+    quantized operations.
+  }];
+}
+
+def MatchQuantizedCustomOps : Pass<"torch-match-quantized-custom-ops", "func::FuncOp"> {
+  let summary = "Match quantized operations that occur in different namespace.";
+  let constructor = "mlir::torch::Torch::createMatchQuantizedCustomOpsPass()";
+  let description = [{
+    Torch quantization utilities generated custom op versions of known aten
+    quantziation operations. We can match these specially named operations and
+    rewrite to the corresponding aten quantized operations.
+
+    We handle this post import to maintain a simplified import process.
+  }];
+}
+
 def ReifyShapeCalculations : Pass<"torch-reify-shape-calculations", "ModuleOp"> {
   let summary = "Reify shape calculations.";
-  let constructor = "mlir::torch::Torch::createReifyShapeCalculationsPass()";
+  let constructor = [{
+    mlir::torch::Torch::createReifyShapeCalculationsPass(/*extraLibrary=*/"")
+  }];
+  let options = [
+    Option<"extraLibrary", "extra-library", "std::string", /*default=*/"",
+           "MLIR module for splicing into the shape library">,
+  ];
   let description = [{
   }];
 }
@@ -255,7 +320,13 @@ def SimplifyShapeCalculations : Pass<"torch-simplify-shape-calculations", "func:
 
 def ReifyDtypeCalculations : Pass<"torch-reify-dtype-calculations", "ModuleOp"> {
   let summary = "Reify dtype calculations.";
-  let constructor = "mlir::torch::Torch::createReifyDtypeCalculationsPass()";
+  let constructor = [{
+    mlir::torch::Torch::createReifyDtypeCalculationsPass(/*extraLibrary=*/"")
+  }];
+  let options = [
+    Option<"extraLibrary", "extra-library", "std::string", /*default=*/"",
+           "MLIR module for splicing into the dtype library">,
+  ];
   let description = [{
   }];
 }
@@ -291,14 +362,14 @@ def LowerToBackendContract
   let summary = "Perform simplifications until the backend contract is satisfied.";
   let constructor = [{
     mlir::torch::Torch::createLowerToBackendContractPass(
-      /*maxIterations=*/10, /*decompose=*/true, /*backendLegalOps=*/{})
+      /*maxIterations=*/10, /*decompose=*/true, /*shapeDtypeRefine*/true, /*backendLegalOps=*/{}, /*extraLibrary=*/"")
   }];
   let description = [{
     This pass performs the bulk of the lowering of the program's computations
     to the backend contract. This pass does not do any global program
     restructuring -- it works entirely within a single semantic model
     of a `builtin.module` with `torch.global_slot` ops and `func.func` ops.
-    
+
     This pass runs a set of simplifications within that semantic model until
     the backend contract is satisfied, and fails if it cannot be satisfied.
     In particular, the backend contract consists of:
@@ -334,8 +405,12 @@ def LowerToBackendContract
            "Maximum number of invocations of the simplification pipeline.">,
     Option<"decompose", "decompose", "bool", /*default=*/"true",
            "Decompose ops.">,
+    Option<"shapeDtypeRefine", "shape-dtype-refine", "bool", /*default=*/"true",
+           "Do shape and dtype refinement.">,
     ListOption<"backendLegalOps", "backend-legal-ops", "std::string",
-               "List of ops to be considered legal for the backend.">
+               "List of ops to be considered legal for the backend, such as 'aten.foo'.">,
+    Option<"extraLibrary", "extra-library", "std::string", /*default=*/"",
+           "MLIR module for splicing into the abstract interpretation library">,
 
   ];
   // TODO: Debug why this is needed, even though the input program has func.func
@@ -343,15 +418,36 @@ def LowerToBackendContract
   let dependentDialects = ["func::FuncDialect"];
 }
 
-def VerifyBackendContract
-    : Pass<"torch-verify-backend-contract", "ModuleOp"> {
+def VerifyBackendContractNoDecompositions
+    : Pass<"torch-verify-backend-contract-no-decompositions", "ModuleOp"> {
   let summary = "Check that program satisfies backend contract.";
-  let constructor =
-    "mlir::torch::Torch::createVerifyBackendContractPass()";
+  let constructor = [{
+    mlir::torch::Torch::createVerifyBackendContractNoDecompositionsPass()
+  }];
   let description = [{
     This pass performs a set of inspections to check that program satisfies backend
-    contract. In case of check failure it prints out the error message and returns
-    `signalPassFailure()` status.
+    contract assuming that no decompositions were applied. In case of check failure
+    it prints out the error message and returns `signalPassFailure()` status.
+  }];
+}
+
+def RestructureNonConstantAxes
+    : Pass<"torch-restructure-non-constant-axes", "func::FuncOp"> {
+  let summary = "Ensure that every Reduction.cpp op has a constant reduction axis.";
+  let constructor = [{
+    mlir::torch::Torch::createRestructureNonConstantAxesPass()
+  }];
+  let description = [{
+    This pass ensures that every Reduction.cpp op has a constant reduction axis.
+
+    It does so using reshapes. For example, a <1,2,3,4,5> tensor will be reshaped to a <?,?,?> tensor
+    and reduced on axis 1 to produce a <?,1,?> tensor. The resulting tensor will be reshaped back to the original shape.
+
+    Then when the axis is supplied at runtime (say axis = -2), the shapes will be computed as so:
+    <?,?,?> becomes <6,4,5>
+    which gets reduced to <6,1,5>
+    and rehsaped back to the original reduction op's output shape,
+    <1,2,3,1,5>
   }];
 }
 

@@ -10,6 +10,7 @@
 #ifndef TORCHMLIR_DIALECT_TORCH_IR_TORCHOPS_H
 #define TORCHMLIR_DIALECT_TORCH_IR_TORCHOPS_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
@@ -39,7 +40,7 @@ struct torch_constant_int_op_binder {
 
   bool match(Operation *op) {
     if (auto constantInt = dyn_cast<Torch::ConstantIntOp>(op)) {
-      *bind_value = constantInt.getValue().getSExtValue();
+      *bind_value = constantInt.getValueAttr().getInt();
       return true;
     }
     return false;
@@ -92,7 +93,7 @@ struct torch_constant_device_op_binder {
 };
 } // namespace detail
 
-/// Matches the integer stored in a `torch.constant.bool`.
+/// Matches the integer stored in a `torch.constant.int`.
 inline detail::torch_constant_int_op_binder
 m_TorchConstantInt(int64_t *bind_value) {
   return detail::torch_constant_int_op_binder(bind_value);
@@ -141,7 +142,7 @@ m_TorchConstantBool(bool *bind_value) {
 }
 
 namespace detail {
-/// Matches the constant integers stored in a `torch.ListConstruct`.
+/// Matches the constant integers stored in a `torch.prim.ListConstruct`.
 struct torch_list_of_constant_ints_op_binder {
   SmallVectorImpl<int64_t> &bind_values;
 
@@ -174,11 +175,11 @@ m_TorchListOfConstantInts(SmallVectorImpl<int64_t> &bind_values) {
 namespace detail {
 /// Matches the optional constant integers stored in a `torch.ListConstruct`.
 struct torch_list_of_optional_constant_ints_op_binder {
-  SmallVectorImpl<Optional<int64_t>> &bind_values;
+  SmallVectorImpl<std::optional<int64_t>> &bind_values;
 
   /// Creates a matcher instance that binds the value to bvs if match succeeds.
   torch_list_of_optional_constant_ints_op_binder(
-      SmallVectorImpl<Optional<int64_t>> &bvs)
+      SmallVectorImpl<std::optional<int64_t>> &bvs)
       : bind_values(bvs) {}
 
   bool match(Operation *op) {
@@ -189,7 +190,7 @@ struct torch_list_of_optional_constant_ints_op_binder {
       int64_t num;
       if (matchPattern(value, m_TorchConstantInt(&num)))
         bind_values.push_back(num);
-      else if (value.getType().isa<Torch::NoneType>())
+      else if (isa<Torch::NoneType>(value.getType()))
         bind_values.push_back(std::nullopt);
       else
         return false;
@@ -203,8 +204,39 @@ struct torch_list_of_optional_constant_ints_op_binder {
 /// `torch.prim.ListConstruct`.
 inline detail::torch_list_of_optional_constant_ints_op_binder
 m_TorchListOfOptionalConstantInts(
-    SmallVectorImpl<Optional<int64_t>> &bind_values) {
+    SmallVectorImpl<std::optional<int64_t>> &bind_values) {
   return detail::torch_list_of_optional_constant_ints_op_binder(bind_values);
+}
+
+namespace detail {
+/// Matches the constant floats stored in a `torch.prim.ListConstruct`.
+struct torch_list_of_constant_floats_op_binder {
+  SmallVectorImpl<double> &bind_values;
+
+  /// Creates a matcher instance that binds the value to bvs if match succeeds.
+  torch_list_of_constant_floats_op_binder(SmallVectorImpl<double> &bvs)
+      : bind_values(bvs) {}
+
+  bool match(Operation *op) {
+    auto listConstruct = dyn_cast<Torch::PrimListConstructOp>(op);
+    if (!listConstruct)
+      return false;
+    for (Value value : listConstruct.getElements()) {
+      double num;
+      if (matchPattern(value, m_TorchConstantFloat(&num)))
+        bind_values.push_back(num);
+      else
+        return false;
+    }
+    return true;
+  }
+};
+} // namespace detail
+
+/// Matches the constant integers stored in a `torch.prim.ListConstruct`.
+inline detail::torch_list_of_constant_floats_op_binder
+m_TorchListOfConstantFloats(SmallVectorImpl<double> &bind_values) {
+  return detail::torch_list_of_constant_floats_op_binder(bind_values);
 }
 
 namespace detail {
@@ -236,6 +268,36 @@ struct torch_list_of_constant_bools_op_binder {
 inline detail::torch_list_of_constant_bools_op_binder
 m_TorchListOfConstantBools(SmallVectorImpl<bool> &bind_values) {
   return detail::torch_list_of_constant_bools_op_binder(bind_values);
+}
+namespace detail {
+/// Matches the constant strs stored in a `torch.ListConstruct`.
+struct torch_list_of_constant_strs_op_binder {
+  SmallVectorImpl<std::string> &bind_values;
+
+  /// Creates a matcher instance that binds the value to bvs if match succeeds.
+  torch_list_of_constant_strs_op_binder(SmallVectorImpl<std::string> &bvs)
+      : bind_values(bvs) {}
+
+  bool match(Operation *op) {
+    auto listConstruct = dyn_cast<Torch::PrimListConstructOp>(op);
+    if (!listConstruct)
+      return false;
+    for (Value value : listConstruct.getElements()) {
+      std::string str;
+      if (matchPattern(value, m_TorchConstantStr(str)))
+        bind_values.push_back(str);
+      else
+        return false;
+    }
+    return true;
+  }
+};
+} // namespace detail
+
+/// Matches the constant strs stored in a `torch.prim.ListConstruct`.
+inline detail::torch_list_of_constant_strs_op_binder
+m_TorchListOfConstantStrs(SmallVectorImpl<std::string> &bind_values) {
+  return detail::torch_list_of_constant_strs_op_binder(bind_values);
 }
 
 namespace detail {
@@ -292,6 +354,21 @@ bool isListPotentiallyMutated(Value list);
 /// A return value of true does not guarantee that the operation mutates
 /// the list.
 bool potentiallyMutatesListOperands(Operation *op);
+
+/// Returns the value from an `IntegerAttr` as an `int64_t`.
+///
+/// @param intAttr the `IntegerAttr` from which to extract the value
+/// @return the value as an `int64_t`
+///
+/// Regardless of the signed-ness of the attribute, this function returns
+/// the value as a signed integer, which implies that if the attribute has
+/// a 64-bit unsigned value, it will be converted to an int64_t in the manner
+/// that uint64_t is cast to int64_t in C++.
+inline int64_t getIntAttrAsSigned(IntegerAttr intAttr) {
+  if (intAttr.getType().isUnsignedInteger())
+    return intAttr.getValue().getZExtValue();
+  return intAttr.getValue().getSExtValue();
+}
 
 } // namespace Torch
 } // namespace torch

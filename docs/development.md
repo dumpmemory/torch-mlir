@@ -5,21 +5,44 @@
 ```shell
 git clone https://github.com/llvm/torch-mlir
 cd torch-mlir
-git submodule update --init
+git submodule update --init --progress
 ```
+
+Optionally, use `--depth=1` to make a shallow clone of the submodules.
+While this is running, you can already setup the Python venv and dependencies in the next step.
 
 ## Setup your Python VirtualEnvironment and Dependencies
 
-Also, ensure that you have the appropriate `python-dev` package installed
-to access the Python development libraries / headers.
-
 ```shell
-python -m venv mlir_venv
+python3 -m venv mlir_venv
 source mlir_venv/bin/activate
 # Some older pip installs may not be able to handle the recent PyTorch deps
 python -m pip install --upgrade pip
 # Install latest PyTorch nightlies and build requirements.
 python -m pip install -r requirements.txt
+python -m pip install -r torchvision-requirements.txt
+```
+
+Also, ensure that you have the appropriate `python-dev` package installed
+to access the Python development libraries / headers. For example, you can install
+it with the following `apt` command on Ubuntu/Debian.
+
+```shell
+sudo apt install python3-dev
+```
+
+
+## (Optional) Set up pre-commit
+
+This project uses [pre-commit](https://pre-commit.com/) in its CI. You can
+install it locally too in order to lint and fix your code prior to the CI
+complaining about it.
+
+```shell
+pip install pre-commit
+# You can run interactively with `pre-commit run`
+# or install hooks so it runs automatically:
+pre-commit install
 ```
 
 ## CMake Build
@@ -30,43 +53,69 @@ Two setups are possible to build: in-tree and out-of-tree. The in-tree setup is 
 
 The following command generates configuration files to build the project *in-tree*, that is, using llvm/llvm-project as the main build. This will build LLVM as well as torch-mlir and its subprojects.  On Windows, use the "Developer PowerShell for Visual Studio" to ensure that the compiler and linker binaries are in the `PATH` variable.
 
+This requires `lld`, `clang`, `ccache`, and other dependencies for building `libtorch` / `PyTorch` wheels from source. If you run into issues because of these, try the [simplified build command](#simplified-build).
+
+```shell
+cmake -GNinja -Bbuild \
+  externals/llvm-project/llvm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DPython3_FIND_VIRTUALENV=ONLY \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_EXTERNAL_PROJECTS="torch-mlir" \
+  -DLLVM_EXTERNAL_TORCH_MLIR_SOURCE_DIR="$PWD" \
+  -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
+  -DLLVM_TARGETS_TO_BUILD=host \
+  `# use clang`\
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  `# use ccache to cache build results` \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  `# use LLD to link in seconds, rather than minutes` \
+  `# if using clang <= 13, replace --ld-path=ld.lld with -fuse-ld=lld` \
+  -DCMAKE_EXE_LINKER_FLAGS_INIT="--ld-path=ld.lld" \
+  -DCMAKE_MODULE_LINKER_FLAGS_INIT="--ld-path=ld.lld" \
+  -DCMAKE_SHARED_LINKER_FLAGS_INIT="--ld-path=ld.lld" \
+  `# Enabling libtorch binary cache instead of downloading the latest libtorch everytime.` \
+  `# Testing against a mismatched version of libtorch may cause failures` \
+  -DLIBTORCH_CACHE=ON \
+  `# Enable an experimental path to build libtorch (and PyTorch wheels) from source,` \
+  `# instead of downloading them` \
+  -DLIBTORCH_SRC_BUILD=ON \
+  `# Set the variant of libtorch to build / link against. (shared|static and optionally cxxabi11)` \
+  -DLIBTORCH_VARIANT=shared
+```
+
+# Simplified build
+
+If you're running into issues with the above build command, consider using the following:
+
 ```shell
 cmake -GNinja -Bbuild \
   -DCMAKE_BUILD_TYPE=Release \
   -DPython3_FIND_VIRTUALENV=ONLY \
   -DLLVM_ENABLE_PROJECTS=mlir \
-  -DLLVM_EXTERNAL_PROJECTS="torch-mlir;torch-mlir-dialects" \
+  -DLLVM_EXTERNAL_PROJECTS="torch-mlir" \
   -DLLVM_EXTERNAL_TORCH_MLIR_SOURCE_DIR="$PWD" \
-  -DLLVM_EXTERNAL_TORCH_MLIR_DIALECTS_SOURCE_DIR="$PWD"/externals/llvm-external-projects/torch-mlir-dialects \
   -DMLIR_ENABLE_BINDINGS_PYTHON=ON \
   -DLLVM_TARGETS_TO_BUILD=host \
   externals/llvm-project/llvm
 ```
-The following additional quality of life flags can be used to reduce build time:
-* Enabling clang on Linux
+
+#### Flags to enable MLIR debugging:
+
+* Enabling `--debug` and `--debug-only` flags (see [MLIR docs](https://mlir.llvm.org/getting_started/Debugging/)) for the `torch-mlir-opt` tool
 ```shell
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \ # or =Debug
+  -DLLVM_ENABLE_ASSERTIONS=ON \
 ```
-* Enabling ccache:
+
+#### Flags to run end-to-end tests:
+
+Running the end-to-end execution tests locally requires enabling the native PyTorch extension features and the JIT IR importer, which depends on the
+former and defaults to `ON` if not changed:
 ```shell
-  -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-```
-* Enabling LLD (links in seconds compared to minutes)
-```shell
-  -DCMAKE_EXE_LINKER_FLAGS_INIT="-fuse-ld=lld" -DCMAKE_MODULE_LINKER_FLAGS_INIT="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS_INIT="-fuse-ld=lld"
-# Use --ld-path= instead of -fuse-ld=lld for clang > 13
-```
-* Enabling libtorch binary cache
-By default we download the latest version of libtorch everytime you build so we are always on the latest version. Set `-DLIBTORCH_CACHE=ON` to
-not download the latest version everytime. If libtorch gets out of date and you test against a newer PyTorch you may notice failures.
-```shell
-  -DLIBTORCH_CACHE=ON
-```
-* Enabling building libtorch as part of your build
-By default we download the latest version of libtorch. We have an experimental path to build libtorch (and PyTorch wheels) from source.
-```shell
-  -DLIBTORCH_SRC_BUILD=ON  # Build Libtorch from source
-  -DLIBTORCH_VARIANT=shared # Set the variant of libtorch to build / link against. (`shared`|`static` and optionally `cxxabi11`)
+  -DTORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS=ON \
+  -DTORCH_MLIR_ENABLE_JIT_IR_IMPORTER=ON \
 ```
 
 ### Building against a pre-built LLVM
@@ -109,37 +158,50 @@ cmake --build build
 ### Linux and macOS
 
 ```shell
-export PYTHONPATH=`pwd`/build/tools/torch-mlir/python_packages/torch_mlir:`pwd`/examples
+export PYTHONPATH=`pwd`/build/tools/torch-mlir/python_packages/torch_mlir:`pwd`/test/python/fx_importer
 ```
 
 ### Windows PowerShell
 
 ```shell
-$env:PYTHONPATH = "$PWD/build/tools/torch-mlir/python_packages/torch_mlir;$PWD/examples"
+$env:PYTHONPATH = "$PWD/build/tools/torch-mlir/python_packages/torch_mlir;$PWD/test/python/fx_importer"
 ```
 
 ## Testing MLIR output in various dialects
 
-To test the compiler's output to the different MLIR dialects, you can use the example `examples/torchscript_resnet18_all_output_types.py`.
+To test the MLIR output to torch dialect, you can use `test/python/fx_importer/basic_test.py`.
 
 Make sure you have activated the virtualenv and set the `PYTHONPATH` above
 (if running on Windows, modify the environment variable as shown above):
 ```shell
 source mlir_venv/bin/activate
-export PYTHONPATH=`pwd`/build/tools/torch-mlir/python_packages/torch_mlir:`pwd`/examples
-python examples/torchscript_resnet18_all_output_types.py
+export PYTHONPATH=`pwd`/build/tools/torch-mlir/python_packages/torch_mlir:`pwd`/test/python/fx_importer
+python test/python/fx_importer/basic_test.py
+```
+
+This will display the basic example in TORCH dialect.
+
+To test the compiler's output to the different MLIR dialects, you can also use the deprecated path
+using torchscript with the example `projects/pt1/examples/torchscript_resnet18_all_output_types.py`.
+This path doesn't give access to the current generation work that is being driven via the fx_importer
+and may lead to errors.
+
+Same as above, but with different python path and example:
+```shell
+export PYTHONPATH=`pwd`/build/tools/torch-mlir/python_packages/torch_mlir:`pwd`/projects/pt1/examples
+python projects/pt1/examples/torchscript_resnet18_all_output_types.py
 ```
 
 This will display the Resnet18 network example in three dialects: TORCH, LINALG on TENSORS and TOSA.
 
-The main functionality is on `torch_mlir.compile()`'s `output_type`.
+The main functionality is on `torch_mlir.torchscript.compile()`'s `output_type`.
 
 Ex:
 ```python
-module = torch_mlir.compile(resnet18, torch.ones(1, 3, 224, 224), output_type="torch")
+module = torch_mlir.torchscript.compile(resnet18, torch.ones(1, 3, 224, 224), output_type="torch")
 ```
 
-Currently, `output_type` can be: `TORCH`, `TOSA`, `LINALG_ON_TENSORS`, `RAW` and `MHLO`.
+`output_type` can be: `TORCH`, `TOSA`, `LINALG_ON_TENSORS`, `RAW` and `STABLEHLO`.
 
 ## Jupyter
 
@@ -287,9 +349,9 @@ The following additional environmental variables can be used to customize your d
 ```
 
 * Custom Python Versions for Release builds:
-  Version of Python to use in Release builds. Ignored in CIs. Defaults to `cp38-cp38 cp39-cp39 cp310-cp310`
+  Version of Python to use in Release builds. Ignored in CIs. Defaults to `cp39-cp39 cp310-cp310 cp312-cp312`
 ```shell
-  TM_PYTHON_VERSIONS="cp38-cp38 cp39-cp39 cp310-cp310"
+  TM_PYTHON_VERSIONS="cp39-cp39 cp310-cp310 cp312-cp312"
 ```
 
 * Location to store Release build wheels
@@ -325,6 +387,15 @@ python -m pip install -r requirements.txt
 CMAKE_GENERATOR=Ninja python setup.py bdist_wheel
 ```
 
+To package a completed CMake build directory,
+you can use the `TORCH_MLIR_CMAKE_BUILD_DIR` and `TORCH_MLIR_CMAKE_ALREADY_BUILT` environment variables:
+```shell
+TORCH_MLIR_CMAKE_BUILD_DIR=build/ TORCH_MLIR_CMAKE_ALREADY_BUILT=1 python setup.py bdist_wheel
+```
+
+Note: The setup.py script is only used for building the Python packages,
+not support commands like `setup.py develop` to build the development environment.
+
 # Testing
 
 Torch-MLIR has two types of tests:
@@ -332,8 +403,10 @@ Torch-MLIR has two types of tests:
 1. End-to-end execution tests. These compile and run a program and check the
    result against the expected output from execution on native Torch. These use
    a homegrown testing framework (see
-   `python/torch_mlir_e2e_test/torchscript/framework.py`) and the test suite
-   lives at `python/torch_mlir_e2e_test/test_suite/__init__.py`.
+   `projects/pt1/python/torch_mlir_e2e_test/framework.py`) and the test suite
+   lives at `projects/pt1/python/torch_mlir_e2e_test/test_suite/__init__.py`.
+   The tests require to build with `TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS` (and
+   the dependent option `TORCH_MLIR_ENABLE_JIT_IR_IMPORTER`) set to `ON`.
 
 2. Compiler and Python API unit tests. These use LLVM's `lit` testing framework.
    For example, these might involve using `torch-mlir-opt` to run a pass and
@@ -348,6 +421,9 @@ Torch-MLIR has two types of tests:
 > **Note**
 > An `.env` file must be generated via `build_tools/write_env_file.sh` before these commands can be run.
 
+
+The following assumes you are in the `projects/pt1`  directory:
+
 ```shell
 # Run all tests on the reference backend
 ./tools/e2e_test.sh
@@ -360,8 +436,23 @@ Torch-MLIR has two types of tests:
 Alternatively, you can run the tests via Python directly:
 
 ```shell
+cd projects/pt1
 python -m e2e_testing.main -f 'AtenEmbeddingBag'
 ```
+
+The default mode of running tests uses the multi-processing framework and is
+not tolerant of certain types of errors. If encountering native crashes/hangs,
+enable debug variables to run sequentially/in-process with more verbosity:
+
+```
+export TORCH_MLIR_TEST_CONCURRENCY=1
+export TORCH_MLIR_TEST_VERBOSE=1
+```
+
+In this way, you can run under `gdb`, etc and get useful results. Having env
+vars like this makes it easy to set in GH action files, etc. Note that the
+verbose flags are very verbose. Basic sequential progress reports will be
+printed regardless when not running in parallel.
 
 ## Running unit tests.
 
@@ -374,7 +465,7 @@ ninja check-torch-mlir-all
 This can be broken down into
 
 ```
-ninja check-torch-mlir check-torch-mlir-dialects check-torch-mlir-python
+ninja check-torch-mlir check-torch-mlir-python
 ```
 
 To run more fine-grained tests, you can do, for `check-torch-mlir`:
@@ -398,7 +489,7 @@ Most of the unit tests use the [`FileCheck` tool](https://llvm.org/docs/CommandG
 
 # PyTorch source builds and custom PyTorch versions
 
-Torch-MLIR by default builds with the latest nightly PyTorch version. This can be toggled to build from latest PyTorch source with 
+Torch-MLIR by default builds with the latest nightly PyTorch version. This can be toggled to build from latest PyTorch source with
 ```
 -DTORCH_MLIR_USE_INSTALLED_PYTORCH=OFF
 -DTORCH_MLIR_SRC_PYTORCH_REPO=vivekkhandelwal1/pytorch # Optional. Github path. Defaults to pytorch/pytorch
@@ -408,12 +499,17 @@ Torch-MLIR by default builds with the latest nightly PyTorch version. This can b
 # Updating the LLVM and MLIR-HLO submodules
 
 Torch-MLIR depends on `llvm-project` (which contains, among other things,
-upstream MLIR) and `mlir-hlo`, both of which are submodules in the `externals/`
+upstream MLIR) and `stablehlo`, both of which are submodules in the `externals/`
 directory. We aim to update these at least weekly to bring in the latest
 features and spread out over time the effort of updating our code for MLIR API
 breakages.
 
 ## Which LLVM commit should I pick?
+
+NOTE: This section is in flux. Specifically, the `mlir-hlo` dep has been
+dropped and the project is running off of a `stablehlo` fork which can be
+patched for certain OS combinations. As of 2023-09-12, stellaraccident@
+is massaging this situation. Please reach out for advice updating.
 
 Since downstream projects may want to build Torch-MLIR (and thus LLVM and
 MLIR-HLO) in various configurations (Release versus Debug builds; on Linux,
@@ -464,10 +560,10 @@ Here are some examples of PRs updating the LLVM and MLIR-HLO submodules:
 
 To enable ASAN, pass `-DLLVM_USE_SANITIZER=Address` to CMake. This should "just
 work" with all C++ tools like `torch-mlir-opt`. When running a Python script
-such as through `./tools/e2e_test.sh`, you will need to do:
+such as through `./projects/pt1/tools/e2e_test.sh`, you will need to do:
 
 ```
-LD_PRELOAD="$(clang -print-file-name=libclang_rt.asan-x86_64.so)" ./tools/e2e_test.sh -s
+LD_PRELOAD="$(clang -print-file-name=libclang_rt.asan-x86_64.so)" ./projects/pt1/tools/e2e_test.sh -s
 # See instructions here for how to get the libasan path for GCC:
 # https://stackoverflow.com/questions/48833176/get-location-of-libasan-from-gcc-clang
 ```

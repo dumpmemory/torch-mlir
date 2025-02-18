@@ -31,8 +31,8 @@ class ValueTensorType;
 
 /// Common getter function signature that covers all tensor types.
 /// Used for sharing code between NonValueTensorType and ValueTensorType.
-using GetTensorTypeFn =
-    llvm::function_ref<Type(MLIRContext *, Optional<ArrayRef<int64_t>>, Type)>;
+using GetTensorTypeFn = llvm::function_ref<Type(
+    MLIRContext *, std::optional<ArrayRef<int64_t>>, Type, Attribute)>;
 
 /// The representation of an unknown dimension size in an ArrayRef<int64_t>.
 constexpr static int64_t kUnknownSize = -1;
@@ -45,13 +45,16 @@ public:
   ///
   /// It is expected that for many users, `hasSizes`/`getSizes` will be a more
   /// convenient API.
-  Optional<ArrayRef<int64_t>> getOptionalSizes() const;
+  std::optional<ArrayRef<int64_t>> getOptionalSizes() const;
 
   /// Get the raw nullable Type representing the dtype of this tensor type.
   ///
   /// It is expected that for many users, `hasDtype`/`getDtype` will be a more
   /// convenient API.
   Type getOptionalDtype() const;
+
+  /// Get the raw optional sparse tensor encoding.
+  Attribute getOptionalSparsity() const;
 
   /// Return true if this type has a list of sizes.
   bool hasSizes() const { return getOptionalSizes().has_value(); }
@@ -90,8 +93,12 @@ public:
 
   /// Return a type of the same kind as this one, but with given raw optional
   /// sizes and raw optional dtype.
-  Type getWithSizesAndDtype(Optional<ArrayRef<int64_t>> optionalSizes,
+  Type getWithSizesAndDtype(std::optional<ArrayRef<int64_t>> optionalSizes,
                             Type optionalDtype) const;
+
+  Type getWithSizesAndDtypeAndSparsity(
+      std::optional<ArrayRef<int64_t>> optionalSizes, Type optionalDtype,
+      Attribute optionalSparsity) const;
 
   /// Return a type with the same shape and dtype as this one, but with
   /// value semantics.
@@ -127,24 +134,33 @@ namespace mlir {
 namespace torch {
 namespace Torch {
 
-inline Optional<ArrayRef<int64_t>> BaseTensorType::getOptionalSizes() const {
-  if (auto tensor = dyn_cast<NonValueTensorType>())
+inline std::optional<ArrayRef<int64_t>>
+BaseTensorType::getOptionalSizes() const {
+  if (auto tensor = mlir::dyn_cast<NonValueTensorType>(*this))
     return tensor.getOptionalSizes();
-  if (auto tensor = dyn_cast<ValueTensorType>())
+  if (auto tensor = mlir::dyn_cast<ValueTensorType>(*this))
     return tensor.getOptionalSizes();
   llvm_unreachable("not a BaseTensorType!");
 }
 
 inline Type BaseTensorType::getOptionalDtype() const {
-  if (auto tensor = dyn_cast<NonValueTensorType>())
+  if (auto tensor = mlir::dyn_cast<NonValueTensorType>(*this))
     return tensor.getOptionalDtype();
-  if (auto tensor = dyn_cast<ValueTensorType>())
+  if (auto tensor = mlir::dyn_cast<ValueTensorType>(*this))
     return tensor.getOptionalDtype();
   llvm_unreachable("not a BaseTensorType!");
 }
 
+inline Attribute BaseTensorType::getOptionalSparsity() const {
+  if (auto tensor = mlir::dyn_cast<NonValueTensorType>(*this))
+    return tensor.getOptionalSparsity();
+  if (auto tensor = mlir::dyn_cast<ValueTensorType>(*this))
+    return tensor.getOptionalSparsity();
+  llvm_unreachable("not a BaseTensorType!");
+}
+
 inline bool BaseTensorType::classof(Type type) {
-  return type.isa<NonValueTensorType, ValueTensorType>();
+  return mlir::isa<NonValueTensorType, ValueTensorType>(type);
 }
 
 } // namespace Torch

@@ -26,7 +26,7 @@ The two main use cases are:
 ## Architecture
 
 Functions are defined as TorchScript-able Python functions in
-`python/torch_mlir/dialects/torch/importer/jit_ir/build_tools/abstract_interp_lib_gen.py`.
+`python/torch_mlir/jit_ir_importer/build_tools/abstract_interp_lib_gen.py`.
 The signatures of the functions are systematically derived from Torch JIT
 operator registry. Most shape functions are expected to reuse the upstream
 helper functions
@@ -104,7 +104,7 @@ that this is minimal.
 
 ## Adding to the abstract interpretation library
 
-See [Adding a Shape and Dtype Function](adding_a_shape_and_dtype_function.md)
+See [Adding Abstract Interpretation Functions](adding_abstract_interpretation_functions.md)
 for details on how to add a shape and dtype function for an operator.
 
 ## Rationale

@@ -10,7 +10,6 @@
 #include "PassDetail.h"
 
 #include "SimplifyAbstractInterpCalculationsUtils.h"
-#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
@@ -18,227 +17,6 @@
 using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
-
-namespace {
-// TODO: Only unroll inside the shape calculation region.
-// Maybe do this by only applying patterns and folding greedily on the ops
-// inside the region + the shape.calculate op itself?
-class FullyUnrollPrimLoopOp : public OpRewritePattern<PrimLoopOp> {
-public:
-  using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(PrimLoopOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    MLIRContext *context = op->getContext();
-    if (!op.isForLike())
-      return rewriter.notifyMatchFailure(op, "Loop is not for-like");
-    int64_t maxTripCount;
-    if (!matchPattern(op.getMaxTripCount(), m_TorchConstantInt(&maxTripCount)))
-      return rewriter.notifyMatchFailure(
-          op, "Expected `maxTripCount` to be a constant int");
-    ;
-    SmallVector<Value> indices;
-    for (int64_t i = 0; i < maxTripCount; i++) {
-      // TODO: Add convenience builder.
-      indices.push_back(rewriter.create<ConstantIntOp>(
-          loc, rewriter.getIntegerAttr(IntegerType::get(context, 64), i)));
-    }
-    Block *beforeBlock = op->getBlock();
-    Block *afterBlock = rewriter.splitBlock(op->getBlock(), op->getIterator());
-
-    SmallVector<Block *> blocksToMerge;
-    BlockAndValueMapping bvm;
-    // TODO: Helper for region().front()
-    auto condition =
-        cast<PrimLoopConditionOp>(op.getRegion().front().getTerminator());
-    for (int64_t i = 0; i < maxTripCount; i++) {
-      SmallVector<Value> iterArgs;
-      if (i == 0) {
-        llvm::append_range(iterArgs, op.getIterArgsInit());
-      } else {
-        llvm::append_range(
-            iterArgs, llvm::map_range(condition.getIterArgs(),
-                                      [&](Value v) { return bvm.lookup(v); }));
-      }
-      bvm.clear();
-      bvm.map(op.getRegion().front().getArgument(0), indices[i]);
-      bvm.map(op.getRegion().front().getArguments().slice(1), iterArgs);
-
-      op.getRegion().cloneInto(afterBlock->getParent(), afterBlock->getIterator(),
-                            bvm);
-      Block *clonedBlock = bvm.lookup(&op.getRegion().front());
-      rewriter.eraseOp(clonedBlock->getTerminator());
-      blocksToMerge.push_back(clonedBlock);
-    }
-
-    blocksToMerge.push_back(afterBlock);
-    for (Block *block : blocksToMerge)
-      rewriter.mergeBlocks(block, beforeBlock);
-    if (maxTripCount == 0) {
-      rewriter.replaceOp(op, op.getIterArgsInit());
-    } else {
-      rewriter.replaceOp(op, llvm::to_vector<6>(llvm::map_range(
-                                 condition.getIterArgs(),
-                                 [&](Value v) { return bvm.lookup(v); })));
-    }
-    return success();
-  }
-};
-} // namespace
-
-namespace {
-class AbstractlyInterpretListOpsWithinABlock
-    : public OpRewritePattern<PrimListConstructOp> {
-public:
-  using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(PrimListConstructOp op,
-                                PatternRewriter &rewriter) const override {
-    Block *block = op->getBlock();
-    auto allUsers = llvm::to_vector<6>(op->getUsers());
-
-    // Sort the users into program order.
-    auto getParentInBlock = [&](Operation *op) {
-      while (op->getBlock() != block)
-        op = op->getParentOp();
-      return op;
-    };
-    // Use a stable sort for deterministic results when users are nested in two
-    // regions of the same parent op.
-    llvm::stable_sort(allUsers, [&](Operation *lhs, Operation *rhs) {
-      return getParentInBlock(lhs)->isBeforeInBlock(getParentInBlock(rhs));
-    });
-
-    // We cannot interpret all ops. So first do a check to see up until which
-    // point we can interpret.
-    int numUsersToInterpret = 0;
-    for (int i = 0, e = allUsers.size(); i != e; i++, numUsersToInterpret++) {
-      Operation *user = allUsers[i];
-      // If a user potentially mutates the list, then we require it to be in the
-      // same block for our simple abstract interpretation to work (we can't,
-      // for example, handle an "append" operation in a loop or other region).
-      // However, if the op is read-only, then from the purpose of our abstract
-      // interpretation, we can handle it effectively as though it was at the
-      // same position as the corresponding parent op in the block under
-      // consideration.
-      if (potentiallyMutatesListOperands(user)) {
-        if (user->getBlock() != block)
-          break;
-      }
-    }
-
-    // Truncate the list of users to the number of users we're going to
-    // interpret.
-    allUsers.resize(numUsersToInterpret);
-    auto usersToInterpret =
-        makeArrayRef(allUsers).take_front(numUsersToInterpret);
-
-    // For each mutating op (which must be in the same block), we save the
-    // current state of the list as a vector of Value's. These will then
-    // be converted to PrimListConstructOp's at the correct program points.
-    SmallVector<SmallVector<Value>> listLiterals;
-    SmallVector<Value> runningList;
-    llvm::append_range(runningList, op->getOperands());
-    bool generatedNewLiteral = false;
-    for (Operation *user : usersToInterpret) {
-      if (auto append = dyn_cast<AtenAppendTOp>(user)) {
-        if (!append.use_empty())
-          return rewriter.notifyMatchFailure(
-              op, "Expected `AtenAppendTOp` to not have users");
-        if (append.getSelf() == op) {
-          runningList.push_back(append.getEl());
-          generatedNewLiteral = true;
-        }
-        listLiterals.push_back(runningList);
-        continue;
-      }
-      if (auto insert = dyn_cast<AtenInsertTOp>(user)) {
-        if (!insert.use_empty())
-          return rewriter.notifyMatchFailure(
-              op, "Expected `AtenInsertTOp` to not have users");
-        int64_t index;
-        if (!matchPattern(insert.getIdx(), m_TorchConstantInt(&index)))
-          return rewriter.notifyMatchFailure(
-              op, "Expected `idx` of `AtenInsertTOp` to be a constant int");
-        // The index might be statically out of bounds.
-        if (index < 0 || index > static_cast<int64_t>(runningList.size()))
-          return rewriter.notifyMatchFailure(
-              op, "Index in `AtenInsertTOp` is out of bounds");
-        if (insert.getSelf() == op) {
-          runningList.insert(runningList.begin() + index, insert.getEl());
-          generatedNewLiteral = true;
-        }
-        listLiterals.push_back(runningList);
-        continue;
-      }
-      if (auto setItem = dyn_cast<Aten_SetItemTOp>(user)) {
-        if (!setItem.use_empty())
-          return rewriter.notifyMatchFailure(
-              op, "Expected `Aten_SetItemTOp` to not have users");
-        llvm::Optional<int64_t> indexOpt =
-            matchLegalConstantIndexIntoListOfSize(setItem.getIdx(),
-                                                  runningList.size());
-        // The index might be statically out of bounds.
-        if (!indexOpt)
-          return rewriter.notifyMatchFailure(
-              op, "Index in `Aten_SetItemTOp` is out of bounds");
-        if (setItem.getL() == op) {
-          runningList[*indexOpt] = setItem.getEl();
-          generatedNewLiteral = true;
-        }
-        listLiterals.push_back(runningList);
-        continue;
-      }
-      // If this user potentially mutates the list and isn't handled above, then
-      // we can't abstractly interpret any further.
-      if (potentiallyMutatesListOperands(user))
-        break;
-    }
-
-    if (!generatedNewLiteral)
-      return rewriter.notifyMatchFailure(op, "No new literal created");
-
-    // Rewrite all users to use the appropriate list literals.
-    Value latestLiteral = rewriter.create<PrimListConstructOp>(
-        op->getLoc(), op.getType(), op->getOperands());
-    int nextLiteral = 0;
-    for (Operation *user : usersToInterpret) {
-      if (auto append = dyn_cast<AtenAppendTOp>(user)) {
-        rewriter.setInsertionPoint(append);
-        latestLiteral = rewriter.create<PrimListConstructOp>(
-            append->getLoc(), op.getType(), listLiterals[nextLiteral++]);
-        if (append.getSelf() == op)
-          rewriter.eraseOp(append);
-        continue;
-      }
-      if (auto insert = dyn_cast<AtenInsertTOp>(user)) {
-        rewriter.setInsertionPoint(insert);
-        latestLiteral = rewriter.create<PrimListConstructOp>(
-            insert->getLoc(), op.getType(), listLiterals[nextLiteral++]);
-        if (insert.getSelf() == op)
-          rewriter.eraseOp(insert);
-        continue;
-      }
-      if (auto setItem = dyn_cast<Aten_SetItemTOp>(user)) {
-        rewriter.setInsertionPoint(setItem);
-        latestLiteral = rewriter.create<PrimListConstructOp>(
-            setItem->getLoc(), op.getType(), listLiterals[nextLiteral++]);
-        if (setItem.getL() == op)
-          rewriter.eraseOp(setItem);
-        continue;
-      }
-      for (OpOperand &opOperand : user->getOpOperands()) {
-        if (opOperand.get() == op.getResult()) {
-          opOperand.set(latestLiteral);
-        }
-      }
-    }
-
-    // Any remaining uses should use the updated value of the latest literal.
-    rewriter.replaceOp(op, latestLiteral);
-    return success();
-  }
-};
-} // namespace
 
 namespace {
 class DecomposeAtenSizeOp : public OpRewritePattern<AtenSizeOp> {
@@ -249,7 +27,7 @@ public:
     Location loc = op.getLoc();
     Value self = op.getSelf();
     MLIRContext *context = op.getContext();
-    auto tensorType = self.getType().cast<BaseTensorType>();
+    auto tensorType = cast<BaseTensorType>(self.getType());
     if (!tensorType.hasSizes())
       return rewriter.notifyMatchFailure(op, "unranked tensor");
     int64_t rank = tensorType.getSizes().size();
@@ -269,16 +47,56 @@ public:
 } // namespace
 
 namespace {
-class FoldPrimUncheckedCastOp : public OpRewritePattern<PrimUncheckedCastOp> {
+class InferTensorOp : public OpRewritePattern<AtenTensorOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(PrimUncheckedCastOp op,
+  LogicalResult matchAndRewrite(AtenTensorOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isValidSubtype(op.getX().getType(), op.getResult().getType())) {
+    auto context = op.getContext();
+    auto loc = op.getLoc();
+    auto result = op.getResult();
+    auto resultType = cast<BaseTensorType>(result.getType());
+    if (resultType.hasSizes() && resultType.hasDtype()) {
       return rewriter.notifyMatchFailure(
-          op, "input tensor type is not a valid subtype of result type");
+          op, "The result of aten.tensor is already a BaseTensorType.");
     }
-    rewriter.replaceOp(op, op.getX());
+
+    auto inputList = op.getOperand(0);
+    auto listConstruct = inputList.getDefiningOp<PrimListConstructOp>();
+    if (!listConstruct) {
+      return rewriter.notifyMatchFailure(
+          op, "The operand 0 of aten.tensor is not PrimListConstructOp.");
+    }
+
+    // Currently only support the 1d input list.
+    SmallVector<int64_t> sizes;
+    sizes.push_back(listConstruct->getOperands().size());
+    FailureOr<Type> torchType;
+    auto eleType = listConstruct->getOperands()[0].getType();
+    if (isa<Torch::IntType>(eleType)) {
+      torchType = getTypeForScalarType(op->getContext(),
+                                       torch_upstream::ScalarType::Long);
+    } else if (isa<Torch::FloatType>(eleType)) {
+      torchType = getTypeForScalarType(op->getContext(),
+                                       torch_upstream::ScalarType::Float);
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "Currently only support Int and Float Type.");
+    }
+    auto newResultType = ValueTensorType::get(context, sizes, *torchType);
+
+    Value originalTypedValue;
+    for (OpOperand &use : llvm::make_early_inc_range(result.getUses())) {
+      if (!originalTypedValue) {
+        rewriter.setInsertionPointAfter(op);
+        originalTypedValue =
+            rewriter.create<TensorStaticInfoCastOp>(loc, resultType, result);
+      }
+      use.set(originalTypedValue);
+    }
+
+    result.setType(newResultType);
+
     return success();
   }
 };
@@ -311,7 +129,7 @@ static LogicalResult refineShapeCalculateResult(ShapeCalculateOp op,
     if (auto setItem = dyn_cast<Aten_SetItemTOp>(user)) {
       // If the index is statically known, we can clobber only a single index.
       // Otherwise, we conservatively clobber all of them.
-      llvm::Optional<int64_t> indexOpt = matchLegalConstantIndexIntoListOfSize(
+      std::optional<int64_t> indexOpt = matchLegalConstantIndexIntoListOfSize(
           setItem.getIdx(), listConstruct->getNumOperands());
       if (indexOpt)
         clobberedElements.set(*indexOpt);
@@ -334,12 +152,11 @@ static LogicalResult refineShapeCalculateResult(ShapeCalculateOp op,
       sizes.push_back(kUnknownSize);
   }
 
-  auto originalResultType = result.getType().cast<BaseTensorType>();
-  auto impliedTypesFromShape =
-      originalResultType.cast<BaseTensorType>()
-          .getWithSizesAndDtype(makeArrayRef(sizes),
-                                originalResultType.getOptionalDtype())
-          .cast<BaseTensorType>();
+  auto originalResultType = cast<BaseTensorType>(result.getType());
+  auto impliedTypesFromShape = cast<BaseTensorType>(
+      cast<BaseTensorType>(originalResultType)
+          .getWithSizesAndDtype(ArrayRef(sizes),
+                                originalResultType.getOptionalDtype()));
 
   return updateCalculateOpResultTypes(op, resultNum, impliedTypesFromShape,
                                       rewriter);
@@ -369,25 +186,27 @@ class SimplifyShapeCalculationsPass
     MLIRContext *context = &getContext();
 
     RewritePatternSet patterns(context);
-    patterns.insert<FullyUnrollPrimLoopOp>(context);
-    patterns.insert<AbstractlyInterpretListOpsWithinABlock>(context);
+    populateFullyUnrollPrimLoopOpPattern(patterns, context);
+    populateAbstractlyInterpretListOpsWithinABlockPattern(patterns, context);
+    populateFoldPrimUncheckedCastOpPattern(patterns, context);
     patterns.insert<DecomposeAtenSizeOp>(context);
     patterns.insert<RefineShapeCalculateOp>(context);
-    patterns.insert<FoldPrimUncheckedCastOp>(context);
+    patterns.insert<InferTensorOp>(context);
 
     PrimIfOp::getCanonicalizationPatterns(patterns, context);
     Aten__Getitem__TOp::getCanonicalizationPatterns(patterns, context);
     AtenSizeOp::getCanonicalizationPatterns(patterns, context);
     AtenLenTOp::getCanonicalizationPatterns(patterns, context);
     AtenAddTOp::getCanonicalizationPatterns(patterns, context);
+    AtenSliceTOp::getCanonicalizationPatterns(patterns, context);
 
     // TODO: Debug visitation order to make this more efficient.
     // A single linear scan should suffice.
     GreedyRewriteConfig config;
     config.useTopDownTraversal = true;
-    config.maxIterations = GreedyRewriteConfig::kNoIterationLimit;
-    if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns),
-                                            config))) {
+    config.maxIterations = GreedyRewriteConfig::kNoLimit;
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                     config))) {
       return signalPassFailure();
     }
   }

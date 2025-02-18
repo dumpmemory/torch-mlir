@@ -25,7 +25,7 @@ torch.class_type @c {
 }
 %c0 = torch.constant.int 0
 %0 = torch.nn_module {
-  // expected-error @+1 {{'torch.slot' op is expected to match type and name of '"torch.attr"() {name = "g", type = !torch.int} : () -> ()}}
+  // expected-error @+1 {{'torch.slot' op is expected to match type and name of '"torch.attr"() <{name = "g", type = !torch.int}> : () -> ()}}
   torch.slot "f", %c0 : !torch.int
 } : !torch.nn.Module<"c">
 
@@ -101,17 +101,17 @@ torch.class_type @c {
 // -----
 
 // expected-error @+1 {{'torch.type_bound' must be attached to an argument of !torch.tensor/!torch.vtensor type}}
-func.func @f(%arg0: i32 {torch.type_bound = !torch.tensor<*,f32>})
+func.func private @f(%arg0: i32 {torch.type_bound = !torch.tensor<*,f32>})
 
 // -----
 
 // expected-error @+1 {{'torch.type_bound' must be TypeAttr}}
-func.func @f(%arg0: i32 {torch.type_bound = 1})
+func.func private @f(%arg0: i32 {torch.type_bound = 1})
 
 // -----
 
 // expected-error @+1 {{'torch.type_bound' must be of !torch.tensor/!torch.vtensor type}}
-func.func @f(%arg0: i32 {torch.type_bound = i32})
+func.func private @f(%arg0: i32 {torch.type_bound = i32})
 
 // -----
 
@@ -264,4 +264,141 @@ torch.global_slot.module_initializer {
   torch.initialize.global_slots [
     @tensor(%1 : !torch.tensor)
   ]
+}
+
+// -----
+
+func.func @torch.tensor_static_info_cast$shape_mismatch(%arg0: !torch.vtensor<[],unk>) -> !torch.vtensor<[?],unk> {
+  // expected-error@+1 {{'torch.tensor_static_info_cast' op operand type '!torch.vtensor<[],unk>' and result type '!torch.vtensor<[?],unk>' are cast incompatible}}
+  %0 = torch.tensor_static_info_cast %arg0 : !torch.vtensor<[],unk> to !torch.vtensor<[?],unk>
+  return %0 : !torch.vtensor<[?],unk>
+}
+
+// -----
+
+func.func @torch.tensor_static_info_cast$dtype_mismatch(%arg0: !torch.vtensor<*,f32>) -> !torch.vtensor<*,f64> {
+  // expected-error@+1 {{'torch.tensor_static_info_cast' op operand type '!torch.vtensor<*,f32>' and result type '!torch.vtensor<*,f64>' are cast incompatible}}
+  %0 = torch.tensor_static_info_cast %arg0 : !torch.vtensor<*,f32> to !torch.vtensor<*,f64>
+  return %0 : !torch.vtensor<*,f64>
+}
+
+
+// -----
+
+func.func @torch.permute$test_changing_rank (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[1,2,3,4],f32> {
+
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int2 = torch.constant.int 2
+
+  %perm = torch.prim.ListConstruct %int1, %int2, %int0 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+
+  // expected-error@+1 {{expected input and output tensors to have same rank, but 3 != 4}}
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[1,2,3,4],f32>
+
+   return %3 : !torch.vtensor<[1,2,3,4],f32>
+}
+
+// -----
+
+func.func @torch.permute$test_permutation_too_short (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[1,2,3],f32> {
+
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+
+  %perm = torch.prim.ListConstruct %int0, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+
+  // expected-error@+1 {{The permutation has 2 elements, the output has rank 3}}
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[1,2,3],f32>
+
+   return %3 : !torch.vtensor<[1,2,3],f32>
+}
+
+// -----
+
+func.func @torch.permute$duplicate_index_in_permutation (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[2,3,1],f32> {
+
+  %int1 = torch.constant.int 1
+  %int2 = torch.constant.int 2
+  %perm = torch.prim.ListConstruct %int1, %int2, %int1 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+
+  // expected-error@+1 {{'torch.aten.permute' op has a duplicate dimension (1) in its permutation}}
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[2,3,1],f32>
+
+   return %3 : !torch.vtensor<[2,3,1],f32>
+}
+
+// -----
+
+func.func @torch.permute$incorrect_output_shape (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[3,1,2],f32> {
+
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int2 = torch.constant.int 2
+  %none = torch.constant.none
+
+  %perm = torch.prim.ListConstruct %int1, %int2, %int0 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+
+  // expected-error@+1 {{'torch.aten.permute' op has a permutation which is not compatible with the input and output shapes. The input shape in dimension 1 is 2, and the output shape in dimension 0 is 3 : they should be the same with this permutation.}}
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[3,1,2],f32>
+
+   return %3 : !torch.vtensor<[3,1,2],f32>
+}
+
+
+// -----
+
+func.func @torch.permute$invalid_index_in_permutation (%arg0: !torch.vtensor<[1,2,3],f32>) -> !torch.vtensor<[1,2,3],f32> {
+
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %int7 = torch.constant.int 7
+  %perm = torch.prim.ListConstruct %int0, %int1, %int7 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+
+
+  // expected-error@+1 {{observed invalid index in permutation (7) for input tensor of rank 3.}}
+  %3 = torch.aten.permute %arg0, %perm : !torch.vtensor<[1,2,3],f32>, !torch.list<int> -> !torch.vtensor<[1,2,3],f32>
+
+   return %3 : !torch.vtensor<[1,2,3],f32>
+}
+
+// -----
+
+#SV = #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>
+
+// expected-error @+1 {{dimension-rank mismatch between encoding and tensor shape: 1 != 2}}
+func.func @foo(%arg0: !torch.vtensor<[64,64],f32,#SV>) -> !torch.vtensor<[64,64],f32,#SV> {
+  return %arg0 : !torch.vtensor<[64,64],f32,#SV>
+}
+
+// -----
+
+// expected-error @+1 {{invalid sparsity encoding attribute}}
+func.func private @tensor.sparse() -> !torch.vtensor<[64,64],f32,12345>
+
+
+// -----
+
+func.func @torch.symbolic_int$no_shape_symbols(%arg0: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
+  %0 = torch.symbolic_int "s0" {min_val = 3, max_val = 6} : !torch.int
+  // expected-error @+1 {{op requires equal number of shape symbol args and symbol args to the attached affine map, since they are 1:1 mapped}}
+  torch.bind_symbolic_shape %arg0, [], affine_map<()[s0] -> (s0)> : !torch.vtensor<[?],f32>
+  return %arg0 : !torch.vtensor<[?],f32>
+}
+
+// -----
+
+// Verifier should not fail here since the op does not require shapeSymbols.
+func.func @torch.symbolic_int$no_shape_symbols_no_symbols_in_map(%arg0: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
+  torch.bind_symbolic_shape %arg0, [], affine_map<()[] -> (1)> : !torch.vtensor<[?],f32>
+  return %arg0 : !torch.vtensor<[?],f32>
+}
+
+// -----
+
+func.func @torch.symbolic_int$no_shape_symbols(%arg0: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
+  %int0 = torch.constant.int 0
+  // expected-error @+1 {{shape symbol must be produced by a SymbolicIntOp}}
+  torch.bind_symbolic_shape %arg0, [%int0], affine_map<()[s0] -> (s0)> : !torch.vtensor<[?],f32>
+  return %arg0 : !torch.vtensor<[?],f32>
 }

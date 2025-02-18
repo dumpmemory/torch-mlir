@@ -15,7 +15,6 @@
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchTypes.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -32,11 +31,11 @@ namespace {
 struct TorchConversionInlinerInterface : public DialectInlinerInterface {
   using DialectInlinerInterface::DialectInlinerInterface;
   bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
-                       BlockAndValueMapping &valueMapping) const final {
+                       IRMapping &valueMapping) const final {
     return true;
   }
   bool isLegalToInline(Operation *, Region *, bool wouldBeCloned,
-                       BlockAndValueMapping &) const final {
+                       IRMapping &) const final {
     return true;
   }
 };
@@ -54,24 +53,23 @@ void TorchConversionDialect::initialize() {
   addInterfaces<TorchConversionInlinerInterface>();
 }
 
-
 //===----------------------------------------------------------------------===//
 // Constant materializer.
 //===----------------------------------------------------------------------===//
 
 Operation *TorchConversionDialect::materializeConstant(OpBuilder &builder,
-                                             Attribute value, Type type,
-                                             Location loc) {
-  if (auto integerType = type.dyn_cast<Torch::IntType>())
-    return builder.create<Torch::ConstantIntOp>(loc, value.cast<IntegerAttr>());
+                                                       Attribute value,
+                                                       Type type,
+                                                       Location loc) {
+  if (auto integerType = dyn_cast<Torch::IntType>(type))
+    return builder.create<Torch::ConstantIntOp>(loc, cast<IntegerAttr>(value));
 
-  if (auto floatType = type.dyn_cast<Torch::FloatType>())
-    return builder.create<Torch::ConstantFloatOp>(loc, value.cast<FloatAttr>());
+  if (auto floatType = dyn_cast<Torch::FloatType>(type))
+    return builder.create<Torch::ConstantFloatOp>(loc, cast<FloatAttr>(value));
 
-  if (type.isa<Torch::BoolType>()) {
-    return builder.create<Torch::ConstantBoolOp>(loc,
-                                                 value.cast<IntegerAttr>());
+  if (isa<Torch::BoolType>(type)) {
+    return builder.create<Torch::ConstantBoolOp>(loc, cast<IntegerAttr>(value));
   }
 
-  return builder.create<arith::ConstantOp>(loc, value, type);
+  return arith::ConstantOp::materialize(builder, value, type, loc);
 }

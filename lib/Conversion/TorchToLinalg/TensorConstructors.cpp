@@ -9,20 +9,18 @@
 
 #include "torch-mlir/Conversion/TorchToLinalg/TorchToLinalg.h"
 
-#include "../PassDetail.h"
 #include "PopulatePatterns.h"
-#include "Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
+#include "torch-mlir/Conversion/TorchToLinalg/Utils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
-#include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
+
+#include <numeric>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -40,40 +38,312 @@ public:
       return failure();
     Location loc = op->getLoc();
     Value self = adaptor.getSelf();
-    auto type = self.getType().cast<RankedTensorType>();
+    auto type = cast<RankedTensorType>(self.getType());
     int64_t rank = type.getRank();
 
-    // Pattern match against the op's original operands, because otherwise we
-    // will get the lowered version of the operands which is harder to pattern
-    // match.
-    SmallVector<int64_t> padInts;
-    if (!matchPattern(op.getPad(), m_TorchListOfConstantInts(padInts)))
-      return rewriter.notifyMatchFailure(
-          op, "only support constant int pad ranges");
-    uint64_t padRank = padInts.size() / 2;
-    if (padRank * 2 != padInts.size())
+    auto primList = op.getPad().getDefiningOp<Torch::PrimListConstructOp>();
+    if (!primList) {
+      return rewriter.notifyMatchFailure(op, "unable to get pad values");
+    }
+
+    SmallVector<Value> padVals(primList.getOperands());
+
+    uint64_t padRank = padVals.size() / 2;
+    if (padRank * 2 != padVals.size())
       return rewriter.notifyMatchFailure(op, "pad range size is not even");
     if (rank < 0 || padRank > (uint64_t)rank)
       return rewriter.notifyMatchFailure(op, "padding exceeds tensor rank");
 
     // Initialize low/high paddings with the dims that should not be padded.
-    SmallVector<int64_t, 4> lowPadding(/*Size=*/rank - padRank, /*Value=*/0);
-    SmallVector<int64_t, 4> highPadding(/*Size=*/rank - padRank, /*Value=*/0);
+    int64_t noPad = rank - padRank;
+    Attribute zero = rewriter.getIndexAttr(0);
+    SmallVector<int64_t> staticLow(noPad, 0);
+    SmallVector<int64_t> staticHigh(noPad, 0);
+    SmallVector<OpFoldResult> lowPad(noPad, zero);
+    SmallVector<OpFoldResult> highPad(noPad, zero);
+
+    auto tc = getTypeConverter();
+
     // Add the requested padding - note op.pad() is highest dim first ordered
     // pairs of low,high.
     for (uint64_t i = padRank; i > 0; --i) {
-      lowPadding.push_back(padInts[i * 2 - 2]);
-      highPadding.push_back(padInts[i * 2 - 1]);
+      int64_t lowi, highi;
+      Value lowv = padVals[i * 2 - 2];
+      Value highv = padVals[i * 2 - 1];
+      if (!matchPattern(lowv, m_TorchConstantInt(&lowi))) {
+        Type cty = tc->convertType(lowv.getType());
+        lowv = tc->materializeTargetConversion(rewriter, loc, cty, lowv);
+        lowv = rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(),
+                                                   lowv);
+        lowPad.push_back(lowv);
+        staticLow.push_back(ShapedType::kDynamic);
+      } else {
+        lowPad.push_back(rewriter.getIndexAttr(lowi));
+        staticLow.push_back(lowi);
+      }
+
+      if (!matchPattern(highv, m_TorchConstantInt(&highi))) {
+        Type cty = tc->convertType(highv.getType());
+        highv = tc->materializeTargetConversion(rewriter, loc, cty, highv);
+        highv = rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getIndexType(), highv);
+        highPad.push_back(highv);
+        staticHigh.push_back(ShapedType::kDynamic);
+      } else {
+        highPad.push_back(rewriter.getIndexAttr(highi));
+        staticHigh.push_back(highi);
+      }
     }
 
     Type newResultType = getTypeConverter()->convertType(op.getType());
-    Type elementType = newResultType.cast<RankedTensorType>().getElementType();
-    Value castedValue =
-        convertScalarToDtype(rewriter, loc, adaptor.getValue(), elementType);
-    Value paddedInput = torch_to_linalg::getPaddedTensor(
-        op, rewriter, self, lowPadding, highPadding, castedValue);
+    Type elementType = cast<RankedTensorType>(newResultType).getElementType();
 
+    auto dstOriginalDtype =
+        cast<Torch::ValueTensorType>(op.getType()).getDtype();
+    Value castedValue =
+        convertScalarToDtype(rewriter, loc, adaptor.getValue(), elementType,
+                             std::nullopt, dstOriginalDtype);
+
+    Type padType = tensor::PadOp::inferResultType(
+        cast<RankedTensorType>(self.getType()), staticLow, staticHigh);
+    Value paddedInput = rewriter.create<tensor::PadOp>(
+        loc, padType, self, lowPad, highPad, castedValue);
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, paddedInput);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+
+// Lower aten.replication_pad2d operator into a sequence of
+// tensor.extract_slice and tensor.concat operations.
+
+class ConvertAtenReplicationPad2dOp
+    : public OpConversionPattern<AtenReplicationPad2dOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenReplicationPad2dOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    Location loc = op->getLoc();
+    Value input = adaptor.getSelf();
+    auto inputType = llvm::cast<RankedTensorType>(input.getType());
+    int64_t inputRank = inputType.getRank();
+    unsigned numDims = inputType.getRank();
+    assert(numDims >= 2 && "Not enough input dimensions");
+
+    SmallVector<int64_t> padInts;
+    if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padInts)))
+      return rewriter.notifyMatchFailure(
+          op, "only support constant int pad ranges");
+    uint64_t padRank = padInts.size() / 2;
+    if (padRank * 2 != padInts.size())
+      return rewriter.notifyMatchFailure(op, "pad range size is not even");
+    if (inputRank < 0 || padRank > (uint64_t)inputRank)
+      return rewriter.notifyMatchFailure(op, "padding exceeds tensor rank");
+
+    SmallVector<Value> inputShape = getTensorSizes(rewriter, loc, input);
+    int64_t hDim = numDims - 1;
+    int64_t vDim = numDims - 2;
+    Value hDimSize = inputShape[hDim];
+    Value vDimSize = inputShape[vDim];
+
+    enum tileHLoc { LEFT = 0, HCENTER = 1, RIGHT = 2 };
+    enum tileVLoc {
+      TOP = 0,
+      VCENTER = 2,
+      BOTTOM = 1,
+    };
+    // vTile denotes the vertical size of the tile
+    // hTile denotes the horizontal size of the tile
+    // The padding results are composed of following tiles:
+    // vTile[TOP]hTile[LEFT], vTile[TOP]hTile[HCENTER], vTile[TOP]hTile[RIGHT]
+    // vTile[VCENTER]hTile[LEFT], vTile[VCENTER]hTile[HCENTER],
+    // vTile[VCENTER]hTile[RIGHT] vTile[BOTTOM]hTile[LEFT],
+    // vTile[BOTTOM]hTile[HCENTER], vTile[BOTTOM]hTile[RIGHT]
+    // vTile[VCENTER]hTile[HCENTER] is the original input tensor
+    Type indexType = rewriter.getIndexType();
+    Value vTile[3];
+    Value hTile[3];
+    vTile[VCENTER] = vDimSize;
+    hTile[HCENTER] = hDimSize;
+    vTile[TOP] = getConstant(rewriter, loc, padInts[2], indexType);
+    vTile[BOTTOM] = getConstant(rewriter, loc, padInts[3], indexType);
+    hTile[LEFT] = getConstant(rewriter, loc, padInts[0], indexType);
+    hTile[RIGHT] = getConstant(rewriter, loc, padInts[1], indexType);
+
+    bool hasLeftPadding = false;
+    bool hasRightPadding = false;
+    bool hasTopPadding = false;
+    bool hasBottomPadding = false;
+
+    for (auto i : {TOP, VCENTER, BOTTOM}) {
+      for (auto j : {LEFT, HCENTER, RIGHT}) {
+        auto constVtile{dyn_cast_or_null<mlir::IntegerAttr>(
+            mlir::dyn_cast<mlir::arith::ConstantOp>(vTile[i].getDefiningOp())
+                .getValue())};
+
+        auto constHtile{dyn_cast_or_null<mlir::IntegerAttr>(
+            mlir::dyn_cast<mlir::arith::ConstantOp>(hTile[j].getDefiningOp())
+                .getValue())};
+        auto vSize = constVtile.getInt();
+        auto hSize = constHtile.getInt();
+
+        if ((i == TOP) && (vSize > 0))
+          hasTopPadding = true;
+        if ((i == BOTTOM) && (vSize > 0))
+          hasBottomPadding = true;
+        if ((j == LEFT) && (hSize > 0))
+          hasLeftPadding = true;
+        if ((j == RIGHT) && (hSize > 0))
+          hasRightPadding = true;
+      }
+    }
+
+    auto createSub = [&](Value x, Value y) {
+      return rewriter.create<arith::SubIOp>(loc, x, y);
+    };
+
+    // Extract left and right pad tiles.
+    Value zero = getConstant(rewriter, loc, 0, indexType);
+    Value one = getConstant(rewriter, loc, 1, indexType);
+    Value hDimSizeMinusOne = createSub(hDimSize, one);
+    Value vDimSizeMinusOne = createSub(vDimSize, one);
+    SmallVector<Value> allOneStridesVal(numDims, one);
+    SmallVector<OpFoldResult> allOneStrides =
+        getAsOpFoldResult(allOneStridesVal);
+
+    SmallVector<Value> extractOffsetsLTVal(numDims, zero);
+    extractOffsetsLTVal[hDim] = zero;
+    extractOffsetsLTVal[vDim] = zero;
+    SmallVector<OpFoldResult> extractOffsetsLT =
+        getAsOpFoldResult(extractOffsetsLTVal);
+    SmallVector<Value> extractShapeLRVal(numDims, one);
+    extractShapeLRVal[hDim] = one;
+    extractShapeLRVal[vDim] = vDimSize;
+    SmallVector<OpFoldResult> extractShapeLR =
+        getAsOpFoldResult(extractShapeLRVal);
+
+    SmallVector<Value> extractOffsetsRightVal(numDims, zero);
+    extractOffsetsRightVal[hDim] = hDimSizeMinusOne;
+    extractOffsetsRightVal[vDim] = zero;
+    SmallVector<OpFoldResult> extractOffsetsRight =
+        getAsOpFoldResult(extractOffsetsRightVal);
+
+    SmallVector<Value> extractOffsetsBottomVal(numDims, zero);
+    extractOffsetsBottomVal[hDim] = zero;
+    extractOffsetsBottomVal[vDim] = vDimSizeMinusOne;
+    SmallVector<OpFoldResult> extractOffsetsBottom =
+        getAsOpFoldResult(extractOffsetsBottomVal);
+
+    SmallVector<Value> extractShapeTBVal(numDims, one);
+    extractShapeTBVal[hDim] = hDimSize;
+    extractShapeTBVal[vDim] = one;
+    SmallVector<OpFoldResult> extractShapeTB =
+        getAsOpFoldResult(extractShapeTBVal);
+
+    SmallVector<Value> tensorsLeft;
+    SmallVector<Value> tensorsRight;
+    SmallVector<Value> tensorsCenter;
+    Value centerTile;
+    SmallVector<Value> tensorsRes;
+
+    if (hasLeftPadding) {
+      Value vCenterLeftSlice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, input, extractOffsetsLT, extractShapeLR, allOneStrides);
+      Value vLeftSlice = vCenterLeftSlice;
+      SmallVector<Value> extractIndices(numDims, zero);
+      if (hasTopPadding) {
+        Value topLeftValue =
+            rewriter.create<tensor::ExtractOp>(loc, input, extractIndices);
+        // pad vCenterLeftSlice on the top
+        SmallVector<int64_t> lowPadding(numDims, 0);
+        SmallVector<int64_t> highPadding(numDims, 0);
+        lowPadding[vDim] = padInts[2];
+        vLeftSlice = torch_to_linalg::getPaddedTensor(
+            op, rewriter, vLeftSlice, lowPadding, highPadding, topLeftValue);
+      }
+      if (hasBottomPadding) {
+        extractIndices[vDim] = vDimSizeMinusOne;
+        Value bottomLeftValue =
+            rewriter.create<tensor::ExtractOp>(loc, input, extractIndices);
+
+        // pad vLeftSlice at the bottom
+        SmallVector<int64_t> lowPadding(numDims, 0);
+        SmallVector<int64_t> highPadding(numDims, 0);
+        highPadding[vDim] = padInts[3];
+        vLeftSlice = torch_to_linalg::getPaddedTensor(
+            op, rewriter, vLeftSlice, lowPadding, highPadding, bottomLeftValue);
+      }
+      for (auto i = 0; i < padInts[0]; ++i) {
+        tensorsLeft.push_back(vLeftSlice);
+      }
+      Value leftPadTile =
+          rewriter.create<tensor::ConcatOp>(loc, hDim, tensorsLeft);
+      tensorsRes.push_back(leftPadTile);
+    }
+    if (hasTopPadding) {
+      Value topHcenterSlice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, input, extractOffsetsLT, extractShapeTB, allOneStrides);
+      for (auto i = 0; i < padInts[2]; ++i) {
+        tensorsCenter.push_back(topHcenterSlice);
+      }
+    }
+    tensorsCenter.push_back(input);
+    if (hasBottomPadding) {
+      Value bottomHcenterSlice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, input, extractOffsetsBottom, extractShapeTB, allOneStrides);
+      for (auto i = 0; i < padInts[3]; ++i) {
+        tensorsCenter.push_back(bottomHcenterSlice);
+      }
+    }
+    centerTile = rewriter.create<tensor::ConcatOp>(loc, vDim, tensorsCenter);
+    tensorsRes.push_back(centerTile);
+
+    if (hasRightPadding) {
+      Value vCenterRightSlice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, input, extractOffsetsRight, extractShapeLR, allOneStrides);
+      Value vRightSlice = vCenterRightSlice;
+      SmallVector<Value> extractIndices(numDims, zero);
+      extractIndices[hDim] = hDimSizeMinusOne;
+      if (hasTopPadding) {
+        Value topRightValue = rewriter.create<tensor::ExtractOp>(
+            loc, input, ValueRange{zero, zero, zero, hDimSizeMinusOne});
+
+        // pad vCenterRightSlice on the top
+        SmallVector<int64_t> lowPadding(numDims, 0);
+        SmallVector<int64_t> highPadding(numDims, 0);
+        lowPadding[vDim] = padInts[2];
+        vRightSlice = torch_to_linalg::getPaddedTensor(
+            op, rewriter, vRightSlice, lowPadding, highPadding, topRightValue);
+      }
+      if (hasBottomPadding) {
+        extractIndices[vDim] = vDimSizeMinusOne;
+        Value bottomRightValue =
+            rewriter.create<tensor::ExtractOp>(loc, input, extractIndices);
+
+        // Pad vCenterRightSlice or vRightTopPaddedSlice at the bottom.
+        SmallVector<int64_t> lowPadding(numDims, 0);
+        SmallVector<int64_t> highPadding(numDims, 0);
+        highPadding[vDim] = padInts[3];
+        vRightSlice = torch_to_linalg::getPaddedTensor(
+            op, rewriter, vRightSlice, lowPadding, highPadding,
+            bottomRightValue);
+      }
+      for (auto i = 0; i < padInts[1]; ++i) {
+        tensorsRight.push_back(vRightSlice);
+      }
+      Value rightPadTile =
+          rewriter.create<tensor::ConcatOp>(loc, hDim, tensorsRight);
+      tensorsRes.push_back(rightPadTile);
+    }
+    Value resTensor = rewriter.create<tensor::ConcatOp>(loc, hDim, tensorsRes);
+    Type newResultType = getTypeConverter()->convertType(op.getType());
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, resTensor);
     return success();
   }
 };
@@ -98,7 +368,7 @@ public:
 
     // The pin_memory should be either `False` or `none`.
     bool pinMemory;
-    if (!op.getPinMemory().getType().template isa<Torch::NoneType>() &&
+    if (!isa<Torch::NoneType>(op.getPinMemory().getType()) &&
         (!matchPattern(op.getPinMemory(), m_TorchConstantBool(&pinMemory)) ||
          pinMemory)) {
       return rewriter.notifyMatchFailure(
@@ -106,7 +376,7 @@ public:
     }
 
     Location loc = op.getLoc();
-    TypeConverter *typeConverter = this->getTypeConverter();
+    const TypeConverter *typeConverter = this->getTypeConverter();
     SmallVector<Value> resultSizeTorchInt, resultSize, resultSizeIndex;
     if (!getListConstructElements(op.getSize(), resultSizeTorchInt)) {
       return rewriter.notifyMatchFailure(
@@ -117,26 +387,31 @@ public:
     for (auto size : resultSize)
       resultSizeIndex.push_back(castIntToIndex(rewriter, loc, size));
 
-    auto resultType = typeConverter->convertType(op.getType())
-                          .template cast<RankedTensorType>();
+    auto resultType =
+        cast<RankedTensorType>(typeConverter->convertType(op.getType()));
     Type resultElementType;
-    if (op.getDtype().getType().template isa<Torch::NoneType>()) {
+    if (isa<Torch::NoneType>(op.getDtype().getType())) {
       resultElementType = resultType.getElementType();
     } else {
       int64_t dtypeInt;
       if (!matchPattern(op.getDtype(), m_TorchConstantInt(&dtypeInt)))
         return rewriter.notifyMatchFailure(
             op, "unimplemented: dtype must be a constant integer or none");
-      resultElementType = getTypeForScalarType(
-          op->getContext(), (torch_upstream::ScalarType)dtypeInt,
-          IntegerType::Signless);
+      FailureOr<Type> maybeResultElementType =
+          torch_to_linalg::getBackendTypeForScalarType(
+              op->getContext(), (torch_upstream::ScalarType)dtypeInt);
+      if (failed(maybeResultElementType)) {
+        return rewriter.notifyMatchFailure(
+            op, "unable to convert `dtypeInt` to builtin type");
+      }
+      resultElementType = *maybeResultElementType;
     }
 
     // Create an uninitialized tensor of `resultSize` shape and fill it with
     // value `fillVal`.
     Value constVal = getConstant(rewriter, loc, fillVal, resultElementType);
-    Value outputTensor =
-        createInitTensor(rewriter, loc, resultSizeIndex, resultElementType, constVal);
+    Value outputTensor = createInitTensor(rewriter, loc, resultSizeIndex,
+                                          resultElementType, constVal);
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, outputTensor);
     return success();
   }
@@ -162,16 +437,17 @@ public:
 
     // The pin_memory should be either `False` or `none`.
     bool pinMemory;
-    if (!op.getPinMemory().getType().template isa<Torch::NoneType>() &&
+    if (!isa<Torch::NoneType>(op.getPinMemory().getType()) &&
         (!matchPattern(op.getPinMemory(), m_TorchConstantBool(&pinMemory)) ||
          pinMemory))
       return rewriter.notifyMatchFailure(
           op, "unimplemented: pin_memory must be either None or false");
 
     // Only `none`, `contiguous` and `preserve` memory_format is supported.
-    if (!op.getMemoryFormat().getType().isa<Torch::NoneType>()) {
+    if (!isa<Torch::NoneType>(op.getMemoryFormat().getType())) {
       int64_t memoryFormat;
-      if (!matchPattern(op.getMemoryFormat(), m_TorchConstantInt(&memoryFormat)))
+      if (!matchPattern(op.getMemoryFormat(),
+                        m_TorchConstantInt(&memoryFormat)))
         return rewriter.notifyMatchFailure(
             op, "unimplemented: the memory format should be specified in "
                 "an integer constant");
@@ -183,7 +459,7 @@ public:
     }
 
     // TODO: Add support for device arg other than cpu.
-    if (!op.getDevice().getType().isa<Torch::NoneType>()) {
+    if (!isa<Torch::NoneType>(op.getDevice().getType())) {
       std::string device;
       if (!matchPattern(op.getDevice(), m_TorchConstantDevice(device)))
         return rewriter.notifyMatchFailure(
@@ -195,7 +471,7 @@ public:
 
     // TODO: Add support for non-strided layout.
     // torch.layout is by default strided i.e. 0.
-    if (!op.getLayout().getType().isa<Torch::NoneType>()) {
+    if (!isa<Torch::NoneType>(op.getLayout().getType())) {
       int64_t tensorLayout;
       if (!matchPattern(op.getLayout(), m_TorchConstantInt(&tensorLayout)))
         return rewriter.notifyMatchFailure(
@@ -206,7 +482,7 @@ public:
     }
 
     Location loc = op.getLoc();
-    TypeConverter *typeConverter = this->getTypeConverter();
+    const TypeConverter *typeConverter = this->getTypeConverter();
     SmallVector<Value> resultSizeTorchInt, resultSize, resultSizeIndex;
     if (!getListConstructElements(op.getSize(), resultSizeTorchInt)) {
       return rewriter.notifyMatchFailure(
@@ -218,18 +494,24 @@ public:
       resultSizeIndex.push_back(castIntToIndex(rewriter, loc, size));
 
     auto resultType =
-        typeConverter->convertType(op.getType()).cast<RankedTensorType>();
+        cast<RankedTensorType>(typeConverter->convertType(op.getType()));
     Type resultElementType;
-    if (op.getDtype().getType().isa<Torch::NoneType>()) {
-      resultElementType = resultType.getElementType();
+    if (isa<Torch::NoneType>(op.getDtype().getType())) {
+      resultElementType = getDefaultDtypeForTorchScalar(
+          Torch::FloatType::get(op->getContext()));
     } else {
       int64_t dtypeInt;
       if (!matchPattern(op.getDtype(), m_TorchConstantInt(&dtypeInt)))
         return rewriter.notifyMatchFailure(
             op, "unimplemented: dtype must be a constant integer or none");
-      resultElementType = getTypeForScalarType(
-          op->getContext(), (torch_upstream::ScalarType)dtypeInt,
-          IntegerType::Signless);
+      FailureOr<Type> maybeResultElementType =
+          torch_to_linalg::getBackendTypeForScalarType(
+              op->getContext(), (torch_upstream::ScalarType)dtypeInt);
+      if (failed(maybeResultElementType)) {
+        return rewriter.notifyMatchFailure(
+            op, "unable to convert `dtypeInt` to builtin type");
+      }
+      resultElementType = *maybeResultElementType;
     }
 
     // Create an uninitialized tensor of `resultSize` shape.
@@ -263,7 +545,7 @@ public:
 
     // The pin_memory should be either `False` or `none`.
     bool pinMemory;
-    if (!op.getPinMemory().getType().isa<Torch::NoneType>() &&
+    if (!isa<Torch::NoneType>(op.getPinMemory().getType()) &&
         (!matchPattern(op.getPinMemory(), m_TorchConstantBool(&pinMemory)) ||
          pinMemory)) {
       return rewriter.notifyMatchFailure(
@@ -271,12 +553,12 @@ public:
     }
 
     Location loc = op.getLoc();
-    TypeConverter *typeConverter = this->getTypeConverter();
-    RankedTensorType resultType =
-        typeConverter->convertType(op->getResult(0).getType())
-            .cast<RankedTensorType>();
+    const TypeConverter *typeConverter = this->getTypeConverter();
+    RankedTensorType resultType = cast<RankedTensorType>(
+        typeConverter->convertType(op->getResult(0).getType()));
     Type dtype = resultType.getElementType();
-    Value start = convertScalarToDtype(rewriter, loc, adaptor.getStart(), dtype);
+    Value start =
+        convertScalarToDtype(rewriter, loc, adaptor.getStart(), dtype);
     Value end = convertScalarToDtype(rewriter, loc, adaptor.getEnd(), dtype);
     Value step = convertScalarToDtype(rewriter, loc, adaptor.getStep(), dtype);
 
@@ -284,7 +566,7 @@ public:
     // The size of the result is calculated as follows:
     //          ceil((end - start)/step)
     Value resultShape;
-    if (dtype.isa<mlir::IntegerType>()) {
+    if (isa<mlir::IntegerType>(dtype)) {
       Value subOut = rewriter.create<arith::SubIOp>(loc, end, start);
       resultShape = rewriter.create<arith::CeilDivSIOp>(loc, subOut, step);
     } else {
@@ -316,7 +598,7 @@ public:
                   index = castIndexToInt64(b, loc, index);
                   index = convertScalarToDtype(b, loc, index, dtype);
                   Value mulOut, result;
-                  if (dtype.isa<mlir::FloatType>()) {
+                  if (isa<mlir::FloatType>(dtype)) {
                     mulOut = b.create<arith::MulFOp>(loc, step, index);
                     result = b.create<arith::AddFOp>(loc, start, mulOut);
                   } else {
@@ -337,6 +619,8 @@ void mlir::torch::torch_to_linalg::
                                                   RewritePatternSet &patterns,
                                                   ConversionTarget &target) {
   MLIRContext *context = patterns.getContext();
+  target.addIllegalOp<AtenReplicationPad2dOp>();
+  patterns.add<ConvertAtenReplicationPad2dOp>(typeConverter, context);
   target.addIllegalOp<AtenConstantPadNdOp>();
   patterns.add<ConvertAtenConstantPadNdOp>(typeConverter, context);
   target.addIllegalOp<AtenZerosOp, AtenOnesOp>();

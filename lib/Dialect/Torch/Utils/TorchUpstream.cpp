@@ -8,6 +8,8 @@
 
 #include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 
+#include "llvm/Support/ErrorHandling.h"
+
 namespace mlir {
 namespace torch {
 namespace torch_upstream {
@@ -19,7 +21,7 @@ static inline bool isQIntType(ScalarType t) {
   // Don't forget to extend this when adding new QInt types
   return t == ScalarType::QInt8 || t == ScalarType::QUInt8 ||
          t == ScalarType::QInt32 || t == ScalarType::QUInt4x2 ||
-         t == ScalarType::QUInt2x4;
+         t == ScalarType::QUInt2x4 || t == ScalarType::QInt16;
 }
 
 //===----------------------------------------------------------------------===//
@@ -124,6 +126,38 @@ ScalarType result_type(const ResultTypeState &in_state) {
   return combine_categories(
       in_state.dimResult,
       combine_categories(in_state.zeroResult, in_state.wrappedResult));
+}
+
+Reduction get_loss_reduction_enum(const llvm::StringRef &reduce) {
+  if (reduce == "none") {
+    return torch_upstream::Reduction::None;
+  } else if (reduce == "mean") {
+    return torch_upstream::Reduction::Mean;
+  } else if (reduce == "sum") {
+    return torch_upstream::Reduction::Sum;
+  } else if (reduce == "end") {
+    return torch_upstream::Reduction::END;
+  } else {
+    llvm_unreachable(
+        "'reduction' argument must be either none, mean, sum or end");
+  }
+}
+
+ReductionType get_reduction_enum(const llvm::StringRef &reduce) {
+  if (reduce == "max" || reduce == "amax") {
+    return torch_upstream::ReductionType::MAX;
+  } else if (reduce == "mean") {
+    return torch_upstream::ReductionType::MEAN;
+  } else if (reduce == "min" || reduce == "amin") {
+    return torch_upstream::ReductionType::MIN;
+  } else if (reduce == "sum") {
+    return torch_upstream::ReductionType::SUM;
+  } else if (reduce == "prod") {
+    return torch_upstream::ReductionType::PROD;
+  } else {
+    llvm_unreachable(
+        "'reduce' argument must be either sum, prod, mean, amax or amin");
+  }
 }
 
 } // namespace torch_upstream

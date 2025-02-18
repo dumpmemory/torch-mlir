@@ -1,4 +1,4 @@
-// RUN: torch-mlir-opt %s -torch-finalizing-backend-type-conversion -split-input-file -verify-diagnostics -allow-unregistered-dialect | FileCheck %s
+// RUN: torch-mlir-opt %s '-pass-pipeline=builtin.module(func.func(torch-finalizing-backend-type-conversion))' -split-input-file -verify-diagnostics -allow-unregistered-dialect | FileCheck %s
 
 // This test is largely copied from `finalizing-bufferize` upstream, as it
 // covers the same scope.
@@ -54,6 +54,20 @@ func.func @eliminate_materializations$torch.Generator(%arg0: i64) -> i64 {
 
 // -----
 
+// CHECK-LABEL:   func.func @eliminate_attributes()
+// CHECK-NOT: attributes
+// CHECK-NOT: torch.onnx_meta
+func.func @eliminate_attributes() attributes {
+  torch.onnx_meta.ir_version = 8 : si64,
+  torch.onnx_meta.opset_version = 17 : si64,
+  torch.onnx_meta.producer_name = "pytorch",
+  torch.onnx_meta.producer_version = "2.1.0"
+} {
+  return
+}
+
+// -----
+
 func.func @unable_to_convert_lone_buffer_cast() -> tensor<f32> {
   // expected-error @+1 {{failed to legalize operation 'test.source'}}
   %0 = "test.source"() : () -> !torch.vtensor<[],f32>
@@ -68,4 +82,14 @@ func.func @unable_to_convert_lone_tensor_load(%arg0: tensor<f32>) {
   // expected-error @+1 {{failed to legalize operation 'test.sink'}}
   "test.sink"(%0) : (!torch.vtensor<[],f32>) -> ()
   return
+}
+
+// -----
+
+// CHECK-LABEL: @extfTruncf
+func.func @extfTruncf(%arg0: f32) -> f32 {
+  %f64 = arith.extf %arg0 : f32 to f64
+  %f32 = arith.truncf %f64 : f64 to f32
+  // CHECK: return %arg0
+  return %f32 : f32
 }

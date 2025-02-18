@@ -1,3 +1,7 @@
+#-------------------------------------------------------------------------------
+# Project setup and globals
+#-------------------------------------------------------------------------------
+
 cmake_minimum_required(VERSION 3.12)
 
 if(POLICY CMP0068)
@@ -17,61 +21,79 @@ if(POLICY CMP0116)
   cmake_policy(SET CMP0116 OLD)
 endif()
 
-#-------------------------------------------------------------------------------
-# Project setup and globals
-#-------------------------------------------------------------------------------
-
 project(torch-mlir LANGUAGES CXX C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-macro(torch_mlir_add_llvm_external_project name identifier location)
-  message(STATUS "Adding LLVM external project ${name} (${identifier}) -> ${location}")
-  if(NOT EXISTS "${location}/CMakeLists.txt")
-    message(FATAL_ERROR "External project location ${location} is not valid")
-  endif()
-  list(APPEND LLVM_EXTERNAL_PROJECTS ${name})
-  list(REMOVE_DUPLICATES LLVM_EXTERNAL_PROJECTS)
-  set(LLVM_EXTERNAL_${identifier}_SOURCE_DIR ${location} CACHE STRING "" FORCE)
-  set(LLVM_EXTERNAL_PROJECTS ${LLVM_EXTERNAL_PROJECTS} CACHE STRING "" FORCE)
-endmacro()
+include(CMakeDependentOption)
 
-option(TORCH_MLIR_ENABLE_MHLO "Add mhlo dialect" ON)
-if(TORCH_MLIR_ENABLE_MHLO)
-  add_definitions(-DTORCH_MLIR_ENABLE_MHLO)
+#-------------------------------------------------------------------------------
+# Project options
+#-------------------------------------------------------------------------------
+
+option(TORCH_MLIR_ENABLE_WERROR_FLAG "Enable `-Werror` flag on supported directories, treat error as warning" OFF)
+option(TORCH_MLIR_USE_INSTALLED_PYTORCH "If depending on PyTorch use it as installed in the current Python environment" ON)
+
+option(TORCH_MLIR_ENABLE_REFBACKEND "Enable reference backend" ON)
+
+if(TORCH_MLIR_ENABLE_REFBACKEND)
+  add_definitions(-DTORCH_MLIR_ENABLE_REFBACKEND)
 endif()
 
-option(TORCH_MLIR_ENABLE_LTC "Enables LTC backend" OFF)
+set(TORCH_MLIR_TABLEGEN_FLAGS "")
 
-if(TORCH_MLIR_ENABLE_LTC)
-    set(ENV{TORCH_MLIR_ENABLE_LTC} 1)
-    message(STATUS "LTC Backend build is enabled")
-else()
-    set(ENV{TORCH_MLIR_ENABLE_LTC} 0)
-    message(STATUS "LTC Backend build is disabled")
+option(TORCH_MLIR_ENABLE_STABLEHLO "Add stablehlo dialect" ON)
+if(TORCH_MLIR_ENABLE_STABLEHLO)
+  add_definitions(-DTORCH_MLIR_ENABLE_STABLEHLO)
+  list(APPEND TORCH_MLIR_TABLEGEN_FLAGS "-DTORCH_MLIR_ENABLE_STABLEHLO")
 endif()
+# It is possible that both stablehlo and torch_mlir projects are used in some compiler project.
+# In this case, we don't want to use stablehlo that is downloaded by torch_mlir (in external/stablehlo)
+# folder but instead want to use stablehlo that is part of top level compiler project.
+# With TORCH_MLIR_USE_EXTERNAL_STABLEHLO enables, it is assumed that top level compiler project makes
+# stablehlo targets AND includes available (for example with `add_subdirectory` and `include_directories`).
+option(TORCH_MLIR_USE_EXTERNAL_STABLEHLO "Use stablehlo from top level project" OFF)
 
-torch_mlir_add_llvm_external_project(
-  torch-mlir-dialects
-  TORCH_MLIR_DIALECTS
-  ${CMAKE_CURRENT_SOURCE_DIR}/externals/llvm-external-projects/torch-mlir-dialects)
+option(TORCH_MLIR_ENABLE_TOSA "Add TOSA support" ON)
+if(TORCH_MLIR_ENABLE_TOSA)
+  add_definitions(-DTORCH_MLIR_ENABLE_TOSA)
+  list(APPEND TORCH_MLIR_TABLEGEN_FLAGS "-DTORCH_MLIR_ENABLE_TOSA")
+endif()
 
 option(TORCH_MLIR_OUT_OF_TREE_BUILD "Specifies an out of tree build" OFF)
 
-# Adjustments to use ccache on Windows
-if (WIN32)
-  find_program(ccache_exe ccache)
-  if(ccache_exe)
-    file(COPY_FILE ${ccache_exe} ${CMAKE_BINARY_DIR}/cl.exe ONLY_IF_DIFFERENT)
-    set(CMAKE_VS_GLOBALS
-      "CLToolExe=cl.exe"
-      "CLToolPath=${CMAKE_BINARY_DIR}"
-      "TrackFileAccess=false"
-      "UseMultiToolTask=true"
-      "DebugInformationFormat=OldStyle"
-    )
-  endif()
+# PyTorch native extension gate. If OFF, then no features which depend on
+# native extensions will be built.TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS is disabled by default.
+# But it will be manually enabled in CI build to enable the jit_ir_importer.build_tools.torch_ods_gen
+# and abstract_interp_lib_gen.py. Once pure python version of build_tools finished, no need to set it in CI.
+option(TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS "Enables PyTorch native extension features" OFF)
+if(TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS)
+  add_definitions(-DTORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS)
 endif()
+# NOTE: The JIT_IR_IMPORTER paths have become unsupportable due to age and lack of maintainers.
+# Turning this off disables the old TorchScript path, leaving FX based import as the current supported option.
+# The option will be retained for a time, and if a maintainer is interested in setting up testing for it,
+# please reach out on the list and speak up for it. It will only be enabled in CI for test usage.
+cmake_dependent_option(TORCH_MLIR_ENABLE_JIT_IR_IMPORTER "Enables JIT IR Importer" ON TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS OFF)
+cmake_dependent_option(TORCH_MLIR_ENABLE_LTC "Enables LTC backend" OFF TORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS OFF)
+
+option(TORCH_MLIR_ENABLE_ONNX_C_IMPORTER "Enables the ONNX C importer" OFF)
+
+macro(torch_mlir_enable_werror)
+  if(TORCH_MLIR_ENABLE_WERROR_FLAG)
+    if(NOT MSVC)
+      add_compile_options(-Werror)
+    endif()
+  endif()
+endmacro()
+
+if(MSVC)
+  add_definitions(-D_USE_MATH_DEFINES)
+endif()
+
+#-------------------------------------------------------------------------------
+# Configure out-of-tree vs in-tree build
+#-------------------------------------------------------------------------------
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR OR TORCH_MLIR_OUT_OF_TREE_BUILD)
   message(STATUS "Torch-MLIR out-of-tree build.")
@@ -108,35 +130,21 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR OR TORCH_MLIR_OUT_OF_TREE_
 
   # Don't try to compile the python extensions at the moment. We need
   # to import lots of dependencies from AddMLIRPython to make this work.
-  set(MLIR_ENABLE_BINDINGS_PYTHON 1)
-  option(TORCH_MLIR_ENABLE_JIT_IR_IMPORTER "Enables JIT IR Importer" ON)
+  set(MLIR_ENABLE_BINDINGS_PYTHON ON)
 
-  set(TORCH-MLIR_BUILT_STANDALONE 1)
+  set(TORCH-MLIR_BUILT_STANDALONE ON)
   set(BACKEND_PACKAGE_STRING "LLVM ${LLVM_PACKAGE_VERSION}")
-  add_subdirectory(externals/llvm-external-projects/torch-mlir-dialects)
 else()
   message(STATUS "Torch-MLIR in-tree build.")
   # In-tree build with LLVM_EXTERNAL_PROJECTS=torch-mlir
 
   option(MLIR_ENABLE_BINDINGS_PYTHON "Enables MLIR Python Bindings" OFF)
-  option(TORCH_MLIR_ENABLE_JIT_IR_IMPORTER "Enables JIT IR Importer" ON)
 
   # TODO: Fix this upstream so that global include directories are not needed.
   set(MLIR_MAIN_SRC_DIR ${LLVM_MAIN_SRC_DIR}/../mlir)
   set(MLIR_INCLUDE_DIR ${LLVM_MAIN_SRC_DIR}/../mlir/include)
   set(MLIR_GENERATED_INCLUDE_DIR ${LLVM_BINARY_DIR}/tools/mlir/include)
   set(MLIR_INCLUDE_DIRS "${MLIR_INCLUDE_DIR};${MLIR_GENERATED_INCLUDE_DIR}")
-endif()
-
-if (TORCH_MLIR_ENABLE_MHLO)
-  set(MHLO_BUILD_EMBEDDED ON)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/externals/mlir-hlo
-    ${CMAKE_CURRENT_BINARY_DIR}/mlir-hlo
-    EXCLUDE_FROM_ALL)
-  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/externals/mlir-hlo/include)
-  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/externals/mlir-hlo)
-  include_directories(${CMAKE_CURRENT_BINARY_DIR}/mlir-hlo/include)
-  include_directories(${CMAKE_CURRENT_BINARY_DIR}/mlir-hlo)
 endif()
 
 set(TORCH_MLIR_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -150,7 +158,8 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR}/include)
 
 function(torch_mlir_target_includes target)
   set(_dirs
-    $<BUILD_INTERFACE:${MLIR_INCLUDE_DIRS}>
+    $<BUILD_INTERFACE:${MLIR_INCLUDE_DIR}>
+    $<BUILD_INTERFACE:${MLIR_GENERATED_INCLUDE_DIR}>
     $<BUILD_INTERFACE:${TORCH_MLIR_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${TORCH_MLIR_BINARY_DIR}/include>
   )
@@ -168,10 +177,12 @@ endfunction()
 # Configure CMake.
 list(APPEND CMAKE_MODULE_PATH ${MLIR_MAIN_SRC_DIR}/cmake/modules)
 list(APPEND CMAKE_MODULE_PATH ${LLVM_MAIN_SRC_DIR}/cmake)
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/build_tools/cmake)
 
 include(TableGen)
 include(AddLLVM)
 include(AddMLIR)
+include(AddMLIRPython)
 
 ################################################################################
 # Setup python.
@@ -187,10 +198,7 @@ add_subdirectory(lib)
 add_subdirectory(tools)
 
 add_custom_target(check-torch-mlir-all)
-add_dependencies(check-torch-mlir-all
-  check-torch-mlir
-  check-torch-mlir-dialects
-  )
+add_dependencies(check-torch-mlir-all check-torch-mlir)
 
 if(MLIR_ENABLE_BINDINGS_PYTHON)
   # If parent projects want to configure where to place the python packages,
@@ -198,12 +206,73 @@ if(MLIR_ENABLE_BINDINGS_PYTHON)
   if(NOT TORCH_MLIR_PYTHON_PACKAGES_DIR)
     set(TORCH_MLIR_PYTHON_PACKAGES_DIR "${CMAKE_CURRENT_BINARY_DIR}/python_packages")
   endif()
-  add_dependencies(check-torch-mlir-all
-  check-torch-mlir-python
-  )
-  add_subdirectory(python)
-else()
-  add_custom_target(TorchMLIRPythonModules)
 endif()
 
 add_subdirectory(test)
+
+if (NOT LLVM_INSTALL_TOOLCHAIN_ONLY)
+  install(DIRECTORY include/torch-mlir include/torch-mlir-c
+          DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+          COMPONENT torch-mlir-headers
+          FILES_MATCHING
+          PATTERN "*.def"
+          PATTERN "*.h"
+          PATTERN "*.inc"
+          PATTERN "*.td"
+          PATTERN "LICENSE.TXT"
+          )
+
+  install(DIRECTORY ${TORCH_MLIR_BINARY_DIR}/include/torch-mlir
+          DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+          COMPONENT torch-mlir-headers
+          FILES_MATCHING
+          PATTERN "*.def"
+          PATTERN "*.h"
+          PATTERN "*.gen"
+          PATTERN "*.inc"
+          PATTERN "*.td"
+          PATTERN "CMakeFiles" EXCLUDE
+          PATTERN "config.h" EXCLUDE
+          )
+
+  if (NOT LLVM_ENABLE_IDE)
+    add_llvm_install_targets(install-torch-mlir-headers
+            DEPENDS torch-mlir-headers
+            COMPONENT torch-mlir-headers)
+  endif()
+endif()
+
+# Important: If loading StableHLO in this fashion, it must come last,
+# after all of our libraries and test targets have been defined.
+# It seems that they both abuse upstream CMake macros that accumulate
+# properties.
+# Getting this wrong results in building large parts of the stablehlo
+# project that we don't actually depend on. Further some of those parts
+# do not even compile on all platforms.
+# Only configure StableHLO if it isn't provided from a top-level project
+if (TORCH_MLIR_ENABLE_STABLEHLO AND NOT TORCH_MLIR_USE_EXTERNAL_STABLEHLO)
+  set(STABLEHLO_BUILD_EMBEDDED ON)
+  set(STABLEHLO_ENABLE_BINDINGS_PYTHON ON)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/externals/stablehlo
+    ${CMAKE_CURRENT_BINARY_DIR}/stablehlo
+    EXCLUDE_FROM_ALL)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/externals/stablehlo)
+endif()
+
+#-------------------------------------------------------------------------------
+# Sub-projects
+#-------------------------------------------------------------------------------
+
+# Sub-projects can bundle additional PyTorch extensions by adding them to this
+# source target. It is typically empty unless if features are enabled.
+if(MLIR_ENABLE_BINDINGS_PYTHON)
+  declare_mlir_python_sources(TorchMLIRPythonTorchExtensionsSources)
+endif()
+
+# Build projects first as it may populate additional Python deps.
+add_subdirectory(projects)
+
+# Finish with top-level Python bindings so it can handle additional deps.
+if(MLIR_ENABLE_BINDINGS_PYTHON)
+  add_subdirectory(python)
+endif()

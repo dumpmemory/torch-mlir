@@ -9,8 +9,6 @@
 
 #include "PassDetail.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
@@ -62,7 +60,8 @@ class RefinePublicReturnPass
     OpBuilder builder(returnOp);
     for (auto operand : returnOp.getOperands()) {
       Value newOperand = operand;
-      // Look through TensorStaticInfoCastOp's and CopyToNonValueTensorOp's.
+      // Look through TensorStaticInfoCastOp's, CopyToNonValueTensorOp's, and
+      // DerefineOp's.
       for (;;) {
         if (auto cast = newOperand.getDefiningOp<TensorStaticInfoCastOp>()) {
           newOperand = cast.getOperand();
@@ -76,12 +75,14 @@ class RefinePublicReturnPass
           if (users.size() != 1)
             break;
           newOperand = copy.getOperand();
+        } else if (auto derefine = newOperand.getDefiningOp<DerefineOp>()) {
+          newOperand = derefine.getOperand();
         } else {
           break;
         }
       }
 
-      if (auto tensorType = newOperand.getType().dyn_cast<BaseTensorType>()) {
+      if (auto tensorType = dyn_cast<BaseTensorType>(newOperand.getType())) {
         newOperands.push_back(
             copyTensorToType(builder, returnOp->getLoc(),
                              tensorType.getWithValueSemantics(), newOperand));

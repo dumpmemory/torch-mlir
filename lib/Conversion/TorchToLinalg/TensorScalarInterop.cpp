@@ -9,17 +9,11 @@
 
 #include "torch-mlir/Conversion/TorchToLinalg/TorchToLinalg.h"
 
-#include "../PassDetail.h"
 #include "PopulatePatterns.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
-#include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
-#include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 
 using namespace mlir;
@@ -38,11 +32,13 @@ public:
     Location loc = op->getLoc();
     Value self = adaptor.getSelf();
     Value dim = adaptor.getDim();
-    auto type = self.getType().cast<RankedTensorType>();
+    auto type = cast<RankedTensorType>(self.getType());
     Value inputRank = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64IntegerAttr(type.getRank()));
     Value dimPositive = toPositiveDimDynamic(rewriter, loc, dim, inputRank);
-    assertIsValidDim(rewriter, loc, dimPositive, inputRank);
+    if (!isAssumingStrictSymbolicShapes(rewriter)) {
+      assertIsValidDim(rewriter, loc, dimPositive, inputRank);
+    }
     Value size = rewriter.create<tensor::DimOp>(
         loc, adaptor.getSelf(), castIntToIndex(rewriter, loc, dimPositive));
     rewriter.replaceOp(op, castIndexToInt64(rewriter, loc, size));
@@ -84,8 +80,7 @@ public:
     Value input = adaptor.getA();
     SmallVector<Value> inputSizes = getTensorSizes(rewriter, loc, input);
     int64_t inputRank = inputSizes.size();
-    Type inputDtype =
-        op.getA().getType().template cast<BaseTensorType>().getDtype();
+    Type inputDtype = cast<BaseTensorType>(op.getA().getType()).getDtype();
 
     // The `input` tensor must contain exactly one element, i.e., either the
     // `input` is a zero rank tensor or all the dimensions of the `input` tensor
@@ -143,17 +138,16 @@ public:
       requires_grad = tensorFloatOp.getRequiresGrad();
     }
     // TODO: Dtype conversion.
-    if (!dtype.getType().isa<Torch::NoneType>())
+    if (!isa<Torch::NoneType>(dtype.getType()))
       return rewriter.notifyMatchFailure(op, "Unimplemented non-None dtype");
 
     // TODO: Device information.
-    if (!device.getType().isa<Torch::NoneType>())
+    if (!isa<Torch::NoneType>(device.getType()))
       return rewriter.notifyMatchFailure(
           op, "Unimplemented non-None device information");
 
-    RankedTensorType resultType = getTypeConverter()
-                                      ->convertType(op->getResult(0).getType())
-                                      .cast<RankedTensorType>();
+    RankedTensorType resultType = cast<RankedTensorType>(
+        getTypeConverter()->convertType(op->getResult(0).getType()));
     Type outElementType = resultType.getElementType();
     Value elemValProm =
         convertScalarToDtype(rewriter, loc, elemVal, outElementType);
@@ -176,12 +170,69 @@ public:
     if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
       return failure();
     Location loc = op.getLoc();
-    Value a = adaptor.getA();
-    Value outTensor =
-        rewriter
-            .create<tensor::EmptyOp>(loc, ArrayRef<OpFoldResult>{}, a.getType())
-            ->getResult(0);
-    rewriter.replaceOpWithNewOp<linalg::FillOp>(op, a, outTensor);
+    RankedTensorType resultType = cast<RankedTensorType>(
+        getTypeConverter()->convertType(op->getResult(0).getType()));
+    Type outElementType = resultType.getElementType();
+    Value elemVal = adaptor.getA();
+    Value elemValProm =
+        convertScalarToDtype(rewriter, loc, elemVal, outElementType);
+    Value zeroDTensor =
+        createInitTensor(rewriter, loc, {}, outElementType, elemValProm);
+    rewriter.replaceOp(op, zeroDTensor);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+class ConvertAtenFullOp : public OpConversionPattern<AtenFullOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenFullOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+    Location loc = op.getLoc();
+
+    SmallVector<Value> inShape;
+    if (!getListConstructElements(adaptor.getSize(), inShape)) {
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: the size list is not from list construct");
+    }
+
+    auto resultTy = cast<RankedTensorType>(
+        this->getTypeConverter()->convertType(op.getResult().getType()));
+    if (resultTy.getRank() != static_cast<int64_t>(inShape.size()))
+      return rewriter.notifyMatchFailure(
+          op, "rank of shape and result shape do not match");
+
+    SmallVector<OpFoldResult> filteredShape;
+    for (int i = 0, s = resultTy.getRank(); i < s; ++i) {
+      if (resultTy.isDynamicDim(i)) {
+        filteredShape.push_back(inShape[i]);
+        continue;
+      }
+
+      filteredShape.push_back(rewriter.getIndexAttr(resultTy.getDimSize(i)));
+    }
+
+    Value full = adaptor.getFillValue();
+
+    if (full.getType() != resultTy.getElementType()) {
+      if (isa<mlir::FloatType>(full.getType())) {
+        full = rewriter.create<arith::TruncFOp>(loc, resultTy.getElementType(),
+                                                full);
+      } else if (isa<mlir::IntegerType>(full.getType())) {
+        full = rewriter.create<arith::TruncIOp>(loc, resultTy.getElementType(),
+                                                full);
+      }
+    }
+
+    Value outTensor = rewriter.create<tensor::EmptyOp>(
+        loc, filteredShape, resultTy.getElementType());
+
+    rewriter.replaceOpWithNewOp<linalg::FillOp>(op, full, outTensor);
 
     return success();
   }
@@ -189,12 +240,14 @@ public:
 } // namespace
 
 namespace {
-class ConvertAtenScalarImplicitOp
-    : public OpConversionPattern<AtenScalarImplicitOp> {
+// Converts a tensor with one element to a scalar value.
+template <typename OpTy>
+class ConvertAtenImplicitLikeOp : public OpConversionPattern<OpTy> {
 public:
-  using OpConversionPattern::OpConversionPattern;
+  using OpConversionPattern<OpTy>::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(AtenScalarImplicitOp op, OpAdaptor adaptor,
+  matchAndRewrite(OpTy op,
+                  typename OpConversionPattern<OpTy>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<tensor::ExtractOp>(op, adaptor.getA());
     return success();
@@ -222,6 +275,15 @@ void mlir::torch::torch_to_linalg::
   patterns.add<ConvertAtenScalarToTensorLike>(typeConverter, context);
   target.addIllegalOp<PrimNumToTensorScalarOp>();
   patterns.add<ConvertPrimNumToTensorScalarOp>(typeConverter, context);
-  patterns.add<ConvertAtenScalarImplicitOp>(typeConverter, context);
-  target.addIllegalOp<AtenScalarImplicitOp>();
+  target.addIllegalOp<AtenFullOp>();
+  patterns.add<ConvertAtenFullOp>(typeConverter, context);
+
+  patterns.add<ConvertAtenImplicitLikeOp<AtenScalarImplicitOp>>(typeConverter,
+                                                                context);
+  patterns.add<ConvertAtenImplicitLikeOp<AtenFloatImplicitOp>>(typeConverter,
+                                                               context);
+  patterns.add<ConvertAtenImplicitLikeOp<AtenIntImplicitOp>>(typeConverter,
+                                                             context);
+  target.addIllegalOp<AtenScalarImplicitOp, AtenFloatImplicitOp,
+                      AtenIntImplicitOp>();
 }

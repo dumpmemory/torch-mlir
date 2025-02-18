@@ -35,7 +35,7 @@ static LogicalResult refineDtypeCalculateResult(DtypeCalculateOp op,
 
   // Calculate the updated type incorporating the new information.
   Type impliedTypeFromDtype;
-  if (result.getType().isa<Torch::NumberType>()) {
+  if (isa<Torch::NumberType>(result.getType())) {
     FailureOr<Type> torchType =
         getTorchTypeForScalarType(op->getContext(), dtypeScalarType);
     if (failed(torchType)) {
@@ -45,11 +45,17 @@ static LogicalResult refineDtypeCalculateResult(DtypeCalculateOp op,
     }
     impliedTypeFromDtype = *torchType;
   } else if (auto originalResultType =
-                 result.getType().dyn_cast<BaseTensorType>()) {
+                 dyn_cast<BaseTensorType>(result.getType())) {
+    FailureOr<Type> builtinType =
+        getTypeForScalarType(op->getContext(), dtypeScalarType);
+    if (failed(builtinType)) {
+      return rewriter.notifyMatchFailure(
+          op, "Failed to convert `dtypeScalarType` to a builtin type");
+    }
     impliedTypeFromDtype =
-        originalResultType.cast<BaseTensorType>().getWithSizesAndDtype(
-            originalResultType.getOptionalSizes(),
-            getTypeForScalarType(op->getContext(), dtypeScalarType));
+        cast<BaseTensorType>(originalResultType)
+            .getWithSizesAndDtype(originalResultType.getOptionalSizes(),
+                                  *builtinType);
   } else {
     return rewriter.notifyMatchFailure(op,
                                        "Unimplemented: Expected result type to "
@@ -83,9 +89,10 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(PromoteDtypesOp op,
                                 PatternRewriter &rewriter) const override {
-    SmallVector<Optional<int64_t>> ranks;
+    SmallVector<std::optional<int64_t>> ranks;
     SmallVector<int64_t> dtypes;
-    if (!matchPattern(op.getRanks(), m_TorchListOfOptionalConstantInts(ranks))) {
+    if (!matchPattern(op.getRanks(),
+                      m_TorchListOfOptionalConstantInts(ranks))) {
       return rewriter.notifyMatchFailure(
           op, "Expected `ranks` to be a list of optional constant ints");
     }
@@ -107,13 +114,13 @@ public:
 
     torch_upstream::ResultTypeState state{};
     for (auto ranksAndDtypes : llvm::zip(ranks, dtypes)) {
-      Optional<int64_t> rank;
+      std::optional<int64_t> rank;
       int64_t dtype;
       std::tie(rank, dtype) = ranksAndDtypes;
       auto scalarType = static_cast<torch_upstream::ScalarType>(dtype);
 
       bool isScalarOnlyOp = llvm::all_of(
-          ranks, [](Optional<int64_t> rank) { return !rank.has_value(); });
+          ranks, [](std::optional<int64_t> rank) { return !rank.has_value(); });
 
       if (!rank.has_value()) {
         // If `rank` does not have a value, then we are dealing with a scalar
@@ -161,17 +168,21 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(PrimNumToTensorScalarOp op,
                                 PatternRewriter &rewriter) const override {
-    auto originalResultType = op.getResult().getType().cast<BaseTensorType>();
+    auto originalResultType = cast<BaseTensorType>(op.getResult().getType());
     if (originalResultType.hasDtype())
       return rewriter.notifyMatchFailure(
           op, "`PrimNumToTensorScalarOp` already has a dtype");
 
+    if (isa<Torch::NumberType>(op.getA().getType())) {
+      return rewriter.notifyMatchFailure(op,
+                                         "`PrimNumToTensorScalarOp`'s input "
+                                         "should have concrete Scalar Type.");
+    }
     Type inputType = getBuiltInTypeForTorchScalar(op.getA().getType());
-    auto impliedTypeFromInputType =
-        originalResultType.cast<BaseTensorType>()
+    auto impliedTypeFromInputType = cast<BaseTensorType>(
+        cast<BaseTensorType>(originalResultType)
             .getWithSizesAndDtype(originalResultType.getOptionalSizes(),
-                                  inputType)
-            .cast<BaseTensorType>();
+                                  inputType));
 
     op.getResult().setType(impliedTypeFromInputType);
     return success();
@@ -186,17 +197,24 @@ class SimplifyDtypeCalculationsPass
     MLIRContext *context = &getContext();
 
     RewritePatternSet patterns(context);
+    populateFullyUnrollPrimLoopOpPattern(patterns, context);
+    populateAbstractlyInterpretListOpsWithinABlockPattern(patterns, context);
+    populateFoldPrimUncheckedCastOpPattern(patterns, context);
     patterns.insert<RefineDtypeCalculateOp>(context);
     patterns.insert<DecomposePromoteDtypesOp>(context);
     patterns.insert<RefineNumToTensorScalarOpType>(context);
+
+    PrimIfOp::getCanonicalizationPatterns(patterns, context);
+    Aten__Getitem__TOp::getCanonicalizationPatterns(patterns, context);
+    PrimTupleUnpackOp::getCanonicalizationPatterns(patterns, context);
 
     // TODO: Debug visitation order to make this more efficient.
     // A single linear scan should suffice.
     GreedyRewriteConfig config;
     config.useTopDownTraversal = true;
-    config.maxIterations = GreedyRewriteConfig::kNoIterationLimit;
-    if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns),
-                                            config))) {
+    config.maxIterations = GreedyRewriteConfig::kNoLimit;
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
+                                     config))) {
       return signalPassFailure();
     }
   }

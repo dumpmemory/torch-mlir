@@ -9,18 +9,14 @@
 
 #include "PassDetail.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BlockAndValueMapping.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
+#include "mlir/IR/IRMapping.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringSet.h"
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -81,8 +77,8 @@ public:
     assert(it != slotLinkageInfo.end());
     return it->second;
   }
-  Optional<LinkageInfo> getFuncLinkageInfo(NnModuleOp instance,
-                                           func::FuncOp methodFunc) {
+  std::optional<LinkageInfo> getFuncLinkageInfo(NnModuleOp instance,
+                                                func::FuncOp methodFunc) {
     auto it = funcLinkageInfo.find({instance, methodFunc});
     if (it == funcLinkageInfo.end())
       return std::nullopt;
@@ -134,7 +130,7 @@ private:
         slotName = setAttrOp.getName();
       }
 
-      auto moduleType = module.getType().cast<NnModuleType>();
+      auto moduleType = cast<NnModuleType>(module.getType());
       auto slots = moduleClassNameToSlots.find(moduleType.getClassName());
       // TODO: Improve verifier so that this can never happen
       if (slots == moduleClassNameToSlots.end())
@@ -163,15 +159,15 @@ private:
     }
 
     auto classType = symbolTable.lookup<ClassTypeOp>(
-        nnModule.getType().cast<NnModuleType>().getClassName());
+        cast<NnModuleType>(nnModule.getType()).getClassName());
     for (auto t :
          llvm::zip(nnModule.getOps<SlotOp>(), classType.getOps<AttrOp>())) {
       auto slot = std::get<0>(t);
       auto attr = std::get<1>(t);
       nameStack.push_back(attr.getName().str());
-      if (attr.getType().isa<NnModuleType>()) {
-        if (failed(
-                recursivelyTraverse(slot.getValue().getDefiningOp<NnModuleOp>())))
+      if (isa<NnModuleType>(attr.getType())) {
+        if (failed(recursivelyTraverse(
+                slot.getValue().getDefiningOp<NnModuleOp>())))
           return failure();
       } else if (usedSlots.find(slot) != usedSlots.end()) {
         // Only create the GlobalSlotOp if the slot is used at all.
@@ -190,8 +186,8 @@ private:
     }
     for (auto method : classType.getOps<MethodOp>()) {
       nameStack.push_back(method.getName().str());
-      funcLinkageInfo[{nnModule,
-                       symbolTable.lookup<func::FuncOp>(method.getFunction())}] =
+      funcLinkageInfo[{
+          nnModule, symbolTable.lookup<func::FuncOp>(method.getFunction())}] =
           LinkageInfo{llvm::join(nameStack, "."), method.getIsPrivate()};
       nameStack.pop_back();
     }
@@ -244,7 +240,7 @@ createGlobalSlotModuleInitializer(ModuleOp module, SymbolTable &symbolTable,
       continue;
     opsToMove.push_back(&op);
   }
-  BlockAndValueMapping mapping;
+  IRMapping mapping;
   for (Operation *op : opsToMove) {
     // The ops are used by `torch.slot` ops in the enclosing module.
     // Cloning avoids needing to handle those uses specially.
@@ -329,11 +325,11 @@ template <> struct llvm::DenseMapInfo<Monomorphization> {
 // currently only analyzes a subset of ops.
 static LogicalResult analyzeInstances(func::FuncOp func,
                                       ArrayRef<ArgInstance> argInstances,
-                                      BlockAndValueMapping &mapping) {
+                                      IRMapping &mapping) {
   for (auto &argInstance : argInstances)
     mapping.map(func.getArgument(argInstance.argIndex), argInstance.instance);
   auto walkResult = func.walk([&](PrimGetAttrOp op) {
-    if (!op.getType().isa<NnModuleType>())
+    if (!isa<NnModuleType>(op.getType()))
       return WalkResult::advance();
     auto instance = mapping.lookupOrNull(op.getReceiver());
     assert(instance && "verifyFuncConformsToSubset should ensure this");
@@ -349,13 +345,13 @@ static LogicalResult analyzeInstances(func::FuncOp func,
 }
 
 static FailureOr<Monomorphization>
-createMonomorphizationForCall(func::CallOp op, BlockAndValueMapping &mapping,
+createMonomorphizationForCall(func::CallOp op, IRMapping &mapping,
                               SymbolTable &symbolTable) {
   auto func = symbolTable.lookup<func::FuncOp>(op.getCallee());
   Monomorphization monomorphization;
   monomorphization.func = func;
   for (auto operand : llvm::enumerate(op->getOperands())) {
-    if (!operand.value().getType().isa<NnModuleType>())
+    if (!isa<NnModuleType>(operand.value().getType()))
       continue;
     Value instance = mapping.lookupOrNull(operand.value());
     assert(instance && "verifyFuncConformsToSubset should ensure this");
@@ -377,7 +373,7 @@ public:
       monomorphization.func = func;
       bool canTriviallyMonomorphize = true;
       for (auto arg : llvm::enumerate(func.getArguments())) {
-        auto type = arg.value().getType().dyn_cast<NnModuleType>();
+        auto type = dyn_cast<NnModuleType>(arg.value().getType());
         if (!type)
           continue;
         auto classType = symbolTable.lookup<ClassTypeOp>(type.getClassName());
@@ -410,7 +406,7 @@ public:
 private:
   LogicalResult generateNewMonomorphizations(const Monomorphization &m) {
     auto func = m.func;
-    BlockAndValueMapping mapping;
+    IRMapping mapping;
     if (failed(analyzeInstances(func, m.argInstances, mapping)))
       return failure();
     auto walkResult = func.walk([&](func::CallOp op) {
@@ -436,7 +432,7 @@ private:
 // !torch.nn.Module<"..."> types.
 static LogicalResult verifyNnModuleValueUses(Value value) {
   // Trivially succeed for non-module types.
-  if (!value.getType().isa<NnModuleType>())
+  if (!isa<NnModuleType>(value.getType()))
     return success();
   for (Operation *op : value.getUsers()) {
     if (isa<func::CallOp, PrimGetAttrOp>(op))
@@ -495,27 +491,30 @@ verifyPublicMonomorphizations(ModuleOp module, SymbolTable &symbolTable,
 // Rewrite `func`, given that all values of `NnModuleType` have been mapped in
 // `mapping` to corresponding global instances.
 static LogicalResult rewriteMonomorphizedFuncClone(
-    func::FuncOp func, BlockAndValueMapping mapping, SymbolTable &symbolTable,
+    func::FuncOp func, IRMapping mapping, SymbolTable &symbolTable,
     DenseMap<Monomorphization, func::FuncOp> &newFuncs,
     ObjectGraphInfo &objectGraphInfo) {
 
   SmallVector<Operation *> toErase;
   auto handlePrimSetAttr = [&](PrimSetAttrOp op) {
-    auto instance = mapping.lookup(op.getReceiver()).getDefiningOp<NnModuleOp>();
+    auto instance =
+        mapping.lookup(op.getReceiver()).getDefiningOp<NnModuleOp>();
     SlotOp affectedSlot;
     for (auto slot : instance.getOps<SlotOp>()) {
       if (slot.getName() == op.getName())
         affectedSlot = slot;
     }
     OpBuilder(op).create<GlobalSlotSetOp>(
-        op.getLoc(), objectGraphInfo.getGlobalSlotFor(affectedSlot).getSymName(),
+        op.getLoc(),
+        objectGraphInfo.getGlobalSlotFor(affectedSlot).getSymName(),
         op.getValue());
     toErase.push_back(op);
     return WalkResult::advance();
   };
   auto handlePrimGetAttr = [&](PrimGetAttrOp op) {
-    if (!op.getType().isa<NnModuleType>()) {
-      auto instance = mapping.lookup(op.getReceiver()).getDefiningOp<NnModuleOp>();
+    if (!isa<NnModuleType>(op.getType())) {
+      auto instance =
+          mapping.lookup(op.getReceiver()).getDefiningOp<NnModuleOp>();
       SlotOp affectedSlot;
       for (auto slot : instance.getOps<SlotOp>()) {
         if (slot.getName() == op.getName())
@@ -537,7 +536,7 @@ static LogicalResult rewriteMonomorphizedFuncClone(
     Monomorphization monomorphization = std::move(*maybeMonomorphization);
     auto newArguments = llvm::to_vector<6>(
         llvm::make_filter_range(op->getOperands(), [](Value v) {
-          return !v.getType().isa<NnModuleType>();
+          return !isa<NnModuleType>(v.getType());
         }));
     assert(newFuncs.find(monomorphization) != newFuncs.end());
     auto newOp = OpBuilder(op).create<func::CallOp>(
@@ -561,7 +560,7 @@ static LogicalResult rewriteMonomorphizedFuncClone(
   }
   llvm::BitVector argsToErase(func.getNumArguments());
   for (auto type : llvm::enumerate(func.getArgumentTypes())) {
-    if (type.value().isa<NnModuleType>()) {
+    if (isa<NnModuleType>(type.value())) {
       argsToErase.set(type.index());
     }
   }
@@ -638,7 +637,7 @@ static LogicalResult globalizeObjectGraph(ModuleOp module) {
   for (auto &monomorphization : tracker.getMonomorphizations()) {
     auto newFunc = cast<func::FuncOp>(monomorphization.func->clone());
     newFuncs[monomorphization] = newFunc;
-    Optional<LinkageInfo> linkageInfo = std::nullopt;
+    std::optional<LinkageInfo> linkageInfo = std::nullopt;
     // If it is potentially a method, check its linkage info.
     if (monomorphization.argInstances.size() != 0 &&
         monomorphization.argInstances[0].argIndex == 0) {
@@ -662,7 +661,7 @@ static LogicalResult globalizeObjectGraph(ModuleOp module) {
   }
 
   for (auto &kv : newFuncs) {
-    BlockAndValueMapping mapping;
+    IRMapping mapping;
     if (failed(analyzeInstances(kv.second, kv.first.argInstances, mapping)))
       return failure();
     if (failed(rewriteMonomorphizedFuncClone(kv.second, mapping, symbolTable,

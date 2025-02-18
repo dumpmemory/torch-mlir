@@ -20,10 +20,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/MLProgram/IR/MLProgram.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Math/Transforms/Approximation.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
-#include "mlir/Dialect/MLProgram/IR/MLProgram.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
@@ -52,13 +54,11 @@ void mlir::torch::RefBackend::registerRefBackendPasses() { ::registerPasses(); }
 //===----------------------------------------------------------------------===//
 
 static bool isArgMemRefTypeValid(Type type) {
-  if (auto memRefType = type.dyn_cast<MemRefType>()) {
+  if (auto memRefType = dyn_cast<MemRefType>(type)) {
     Type elemTy = memRefType.getElementType();
-    if (elemTy.isa<Float32Type>()) {
+    if (isa<Float16Type, Float32Type, Float64Type>(elemTy)) {
       return true;
-    } else if (elemTy.isa<Float64Type>()) {
-      return true;
-    } else if (auto integerTy = elemTy.dyn_cast<IntegerType>()) {
+    } else if (auto integerTy = dyn_cast<IntegerType>(elemTy)) {
       if (integerTy.isSignlessInteger(64))
         return true;
       if (integerTy.isSignlessInteger(32))
@@ -69,6 +69,8 @@ static bool isArgMemRefTypeValid(Type type) {
         return true;
       if (integerTy.isSignlessInteger(1))
         return true;
+    } else if (auto complexTy = dyn_cast<ComplexType>(elemTy)) {
+      return isa<Float32Type, Float64Type>(complexTy.getElementType());
     }
   }
   return false;
@@ -79,7 +81,7 @@ static void addEmitCInterfaceAttr(func::FuncOp func) {
 }
 
 static Type getAbiTypeForMemRef(Type type) {
-  return UnrankedMemRefType::get(type.cast<MemRefType>().getElementType(), 0);
+  return UnrankedMemRefType::get(cast<MemRefType>(type).getElementType(), 0);
 }
 
 // Helper function to get the type string for one return value like i32, f64,
@@ -88,9 +90,12 @@ static Type getAbiTypeForMemRef(Type type) {
 static std::string getTypeToken(Type type) {
   if (type.isSignlessInteger())
     return ("i" + Twine(type.getIntOrFloatBitWidth())).str();
-  else if (type.isa<mlir::FloatType>())
+  else if (isa<mlir::FloatType>(type))
     return ("f" + Twine(type.getIntOrFloatBitWidth())).str();
-  else if (auto memRefType = type.dyn_cast<UnrankedMemRefType>())
+  else if (auto complexTy = dyn_cast<mlir::ComplexType>(type))
+    return ("c" + Twine(complexTy.getElementType().getIntOrFloatBitWidth()))
+        .str();
+  else if (auto memRefType = dyn_cast<UnrankedMemRefType>(type))
     return "mr" + getTypeToken(memRefType.getElementType());
 
   llvm_unreachable(
@@ -145,7 +150,8 @@ static LogicalResult mungeFunction(
     auto type = arg.getType();
     if (!isArgMemRefTypeValid(type)) {
       return emitError(arg.getLoc())
-          .append("argument must be a memref of f32, f64, i32, i64, i8, i1 but "
+          .append("argument must be a memref of f32, f64, i32, i64, i8, i1, "
+                  "c32, c64, but "
                   "got ",
                   type);
     }
@@ -165,7 +171,7 @@ static LogicalResult mungeFunction(
     for (auto en : llvm::enumerate(types)) {
       Type retType = en.value();
       Value retVal = op.getOperand(en.index());
-      if (auto memrefReturnType = retType.dyn_cast<MemRefType>()) {
+      if (auto memrefReturnType = dyn_cast<MemRefType>(retType)) {
         auto elemType = memrefReturnType.getElementType();
         retType = UnrankedMemRefType::get(elemType, 0);
         // Cast to unranked memref type before sending it as a function
@@ -228,7 +234,7 @@ static LogicalResult bufferizeMLProgramGlobalOp(ml_program::GlobalOp globalOp,
   if (!globalOp.getValue().has_value())
     return globalOp.emitError("global op must have a value");
 
-  RankedTensorType tensorType = globalOp.getType().cast<RankedTensorType>();
+  RankedTensorType tensorType = cast<RankedTensorType>(globalOp.getType());
   MemRefType memrefType =
       MemRefType::get(tensorType.getShape(), tensorType.getElementType());
 
@@ -246,7 +252,7 @@ static LogicalResult bufferizeMLProgramGlobalOp(ml_program::GlobalOp globalOp,
 static LogicalResult
 bufferizeMLProgramGlobaLoadOp(ml_program::GlobalLoadOp globalLoadOp,
                               OpBuilder &b, SmallVector<Operation *> &toErase) {
-  RankedTensorType tensorType = globalLoadOp.getType().cast<RankedTensorType>();
+  RankedTensorType tensorType = cast<RankedTensorType>(globalLoadOp.getType());
   MemRefType memrefType =
       MemRefType::get(tensorType.getShape(), tensorType.getElementType());
 
@@ -265,7 +271,7 @@ bufferizeMLProgramGlobaStoreOp(ml_program::GlobalStoreOp globalStoreOp,
                                OpBuilder &b,
                                SmallVector<Operation *> &toErase) {
   RankedTensorType tensorType =
-      globalStoreOp.getValue().getType().cast<RankedTensorType>();
+      cast<RankedTensorType>(globalStoreOp.getValue().getType());
   MemRefType memrefType =
       MemRefType::get(tensorType.getShape(), tensorType.getElementType());
 
@@ -294,7 +300,7 @@ class MLProgramBufferize : public MLProgramBufferizeBase<MLProgramBufferize> {
     SmallVector<Operation *> toErase;
 
     auto walkResult = module.walk([&](ml_program::GlobalOp op) {
-      if (auto type = op.getType().dyn_cast<RankedTensorType>()) {
+      if (auto type = dyn_cast<RankedTensorType>(op.getType())) {
         if (!type.hasStaticShape()) {
           // If the ml_program.global has dynamically shaped tensor.
           op.emitError(
@@ -381,8 +387,8 @@ mlir::torch::RefBackend::createExpandOpsForLLVMPass() {
 
 Operation *createLinalgCopyOp(OpBuilder &b, Location loc, Value from,
                               Value to) {
-  auto memrefTypeFrom = from.getType().cast<MemRefType>();
-  auto memrefTypeTo = to.getType().cast<MemRefType>();
+  auto memrefTypeFrom = cast<MemRefType>(from.getType());
+  auto memrefTypeTo = cast<MemRefType>(to.getType());
   (void)memrefTypeFrom;
   assert(memrefTypeFrom && memrefTypeTo &&
          memrefTypeFrom.getRank() == memrefTypeTo.getRank());
@@ -394,7 +400,7 @@ Operation *createLinalgCopyOp(OpBuilder &b, Location loc, Value from,
       loc,
       /*inputs=*/from,
       /*outputs=*/to,
-      /*indexingMaps=*/llvm::makeArrayRef({id, id}),
+      /*indexingMaps=*/llvm::ArrayRef({id, id}),
       /*iteratorTypes=*/iteratorTypes,
       [](OpBuilder &b, Location loc, ValueRange args) {
         b.create<linalg::YieldOp>(loc, args.front());
@@ -419,8 +425,7 @@ class MungeMemrefCopy : public MungeMemrefCopyBase<MungeMemrefCopy> {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(&getContext());
     patterns.insert<MemrefCopyOpToLinalg>(context);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }
@@ -433,6 +438,28 @@ mlir::torch::RefBackend::createMungeMemrefCopyPass() {
 }
 
 namespace {
+class GeneralizeTensorConcat
+    : public GeneralizeTensorConcatBase<GeneralizeTensorConcat> {
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<tensor::TensorDialect>();
+  }
+
+  void runOnOperation() override {
+    RewritePatternSet patterns(&getContext());
+    tensor::populateDecomposeTensorConcatPatterns(patterns);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+      return signalPassFailure();
+    }
+  }
+};
+} // namespace
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+mlir::torch::RefBackend::createGeneralizeTensorConcatPass() {
+  return std::make_unique<GeneralizeTensorConcat>();
+}
+
+namespace {
 class GeneralizeTensorPad
     : public GeneralizeTensorPadBase<GeneralizeTensorPad> {
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -442,9 +469,8 @@ class GeneralizeTensorPad
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(&getContext());
-    patterns.insert<linalg::GeneralizePadOpPattern>(context);
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                            std::move(patterns)))) {
+    patterns.insert<linalg::DecomposePadOpPattern>(context);
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       return signalPassFailure();
     }
   }

@@ -105,6 +105,16 @@ def ConvertTorchToLinalg : Pass<"convert-torch-to-linalg", "func::FuncOp"> {
   let constructor = "mlir::torch::createConvertTorchToLinalgPass()";
 }
 
+def ConvertTorchToTensor : Pass<"convert-torch-to-tensor", "func::FuncOp"> {
+  let summary = "Convert Torch ops to the Tensor dialect";
+  let description = [{
+    Converts any `Torch` operators that were expressible as `Tensor` dialect
+    operations.
+  }];
+  let constructor = "mlir::torch::createConvertTorchToTensorPass()";
+}
+
+#ifdef TORCH_MLIR_ENABLE_TOSA
 def ConvertTorchToTosa : Pass<"convert-torch-to-tosa", "func::FuncOp"> {
   let summary = "Convert Torch ops to TOSA ops";
   let description = [{
@@ -113,6 +123,7 @@ def ConvertTorchToTosa : Pass<"convert-torch-to-tosa", "func::FuncOp"> {
   }];
   let constructor = "mlir::torch::createConvertTorchToTosaPass()";
 }
+#endif
 
 def ConvertTorchToTMTensor : Pass<"convert-torch-to-tmtensor", "func::FuncOp"> {
   let summary = "Convert recognized Torch ops to TMTensor/Linalg ops";
@@ -125,7 +136,7 @@ def ConvertTorchToTMTensor : Pass<"convert-torch-to-tmtensor", "func::FuncOp"> {
   let constructor = "mlir::torch::createConvertTorchToTMTensorPass()";
 }
 
-def ConvertTorchConversionToMLProgram : Pass<"convert-torch-conversion-to-mlprogram", "func::FuncOp"> {
+def ConvertTorchConversionToMLProgram : Pass<"convert-torch-conversion-to-mlprogram", "ModuleOp"> {
   let summary = "Convert recognized TorchConversion ops to MLProgram ops";
   let description = [{
     Convert TorchConversion ops to mlprogram ops.
@@ -133,13 +144,13 @@ def ConvertTorchConversionToMLProgram : Pass<"convert-torch-conversion-to-mlprog
   let constructor = "mlir::torch::createConvertTorchConversionToMLProgramPass()";
 }
 
-#ifdef TORCH_MLIR_ENABLE_MHLO
-def ConvertTorchToMhlo : Pass<"convert-torch-to-mhlo", "func::FuncOp"> {
-  let summary = "Convert Torch ops to MHLO ops";
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+def ConvertTorchToStablehlo : Pass<"convert-torch-to-stablehlo", "func::FuncOp"> {
+  let summary = "Convert Torch ops to Stablehlo ops";
   let description = [{
-    Convert Torch ops to mhlo ops.
+    Convert Torch ops to Stablehlo ops.
   }];
-  let constructor = "mlir::torch::createConvertTorchToMhloPass()";
+  let constructor = "mlir::torch::createConvertTorchToStablehloPass()";
 
   // Specify any options.
   let options = [

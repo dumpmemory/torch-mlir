@@ -3,7 +3,7 @@
 
 // CHECK-LABEL:   func.func @elementwise$unary(
 // CHECK-SAME:                            %[[ARG:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[],f32> {
-// CHECK:           %[[BUILTIN_TENSOR:.*]] = torch_c.to_builtin_tensor %[[ARG]] : !torch.vtensor<[],f32> -> tensor<f32>
+// CHECK-DAG:       %[[BUILTIN_TENSOR:.*]] = torch_c.to_builtin_tensor %[[ARG]] : !torch.vtensor<[],f32> -> tensor<f32>
 // CHECK:           %[[INIT_TENSOR:.*]] = tensor.empty() : tensor<f32>
 // CHECK:           %[[GENERIC:.*]] = linalg.generic {indexing_maps = [affine_map<() -> ()>, affine_map<() -> ()>], iterator_types = []} ins(%[[BUILTIN_TENSOR]] : tensor<f32>) outs(%[[INIT_TENSOR]] : tensor<f32>) {
 // CHECK:           ^bb0(%[[BBARG0:.*]]: f32, %{{.*}}: f32):
@@ -19,11 +19,13 @@ func.func @elementwise$unary(%arg0: !torch.vtensor<[],f32>) -> !torch.vtensor<[]
   return %0 : !torch.vtensor<[],f32>
 }
 
+// -----
+
 // CHECK-LABEL:   func.func @elementwise$binary(
 // CHECK-SAME:                             %[[ARG0:.*]]: !torch.vtensor<[?,?],f32>,
 // CHECK-SAME:                             %[[ARG1:.*]]: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?,?],f32> {
-// CHECK:           %[[BUILTIN_ARG0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?],f32> -> tensor<?x?xf32>
-// CHECK:           %[[BUILTIN_ARG1:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[?],f32> -> tensor<?xf32>
+// CHECK-DAG:       %[[BUILTIN_ARG0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?],f32> -> tensor<?x?xf32>
+// CHECK-DAG:       %[[BUILTIN_ARG1:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[?],f32> -> tensor<?xf32>
 // CHECK:           %[[C0:.*]] = arith.constant 0 : index
 // CHECK:           %[[ARG0_DIM0:.*]] = tensor.dim %[[BUILTIN_ARG0]], %[[C0]] : tensor<?x?xf32>
 // CHECK:           %[[C1:.*]] = arith.constant 1 : index
@@ -46,6 +48,8 @@ func.func @elementwise$binary(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vt
   return %0 : !torch.vtensor<[?,?],f32>
 }
 
+// -----
+
 // CHECK-LABEL:   func.func @elementwise$ternary(
 // CHECK:       linalg.generic {indexing_maps = [
 // CHECK-SAME:    affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
@@ -57,11 +61,13 @@ func.func @elementwise$ternary(%arg0: !torch.vtensor<[?,?,?],f32>, %arg1: !torch
   return %0 : !torch.vtensor<[?,?,?],f32>
 }
 
+// -----
+
 // CHECK-LABEL:   func.func @elementwise$with_scalar_capture(
 // CHECK-SAME:                                          %[[VAL_0:.*]]: !torch.vtensor<[?],f32>,
 // CHECK-SAME:                                          %[[VAL_1:.*]]: !torch.vtensor<[],f32>) -> !torch.vtensor<[?],f32> {
 // CHECK:           %[[C1:.*]] = torch.constant.int 1
-// CHECK:           %[[BUILTIN_C1:.*]] = torch_c.to_i64 %[[C1]]
+// CHECK:           %[[BUILTIN_C1:.*]] = arith.constant 1 : i64
 // CHECK:           linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>]
 // CHECK:           ^bb0(%[[LHS:.*]]: f32, %[[RHS:.*]]: f32, %{{.*}}: f32):
 // CHECK:             %[[ALPHA:.*]] = arith.sitofp %[[BUILTIN_C1]] : i64 to f32
@@ -75,6 +81,8 @@ func.func @elementwise$with_scalar_capture(%arg0: !torch.vtensor<[?],f32>, %arg1
   return %0 : !torch.vtensor<[?],f32>
 }
 
+// -----
+
 // CHECK-LABEL:   func.func @elementwise$static_1(
 // CHECK:           linalg.generic {indexing_maps = [
 // CHECK-SAME:        affine_map<(d0) -> (d0)>,
@@ -87,10 +95,26 @@ func.func @elementwise$static_1(%arg0: !torch.vtensor<[?],f32>, %arg1: !torch.vt
 
 // -----
 
-func.func @insufficient_dims_for_triu(%arg0: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?],f32> {
-  %int0 = torch.constant.int 0
-  // expected-error@+2 {{failed to legalize operation 'torch.aten.triu' that was explicitly marked illegal}}
-  // expected-error@+1 {{too few dimensions to compute triangular part of matrix}}
-  %0 = torch.aten.triu %arg0, %int0 : !torch.vtensor<[?],f32>, !torch.int -> !torch.vtensor<[?],f32>
-  return %0 : !torch.vtensor<[?],f32>
+// CHECK-LABEL:    func.func @elementwise_sinh
+// CHECK:            linalg.generic
+// CHECK:            math.sinh
+func.func @elementwise_sinh(%arg0: !torch.vtensor<[3],f32>) -> !torch.vtensor<[3],f32> {
+  %0 = torch.aten.sinh %arg0 : !torch.vtensor<[3],f32> -> !torch.vtensor<[3],f32>
+  return %0 : !torch.vtensor<[3],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @elementwise_todtype_bf162f16(
+// CHECK:                linalg.generic
+// CHECK:                  arith.extf
+// CHECK-SAME:               bf16 to f32
+// CHECK:                  arith.truncf
+// CHECK-SAME:               f32 to f16
+func.func @elementwise_todtype_bf162f16(%arg0: !torch.vtensor<[1,?,32,128],bf16>) -> !torch.vtensor<[1,?,32,128],f16> {
+  %int5 = torch.constant.int 5
+  %false = torch.constant.bool false
+  %none = torch.constant.none
+  %0 = torch.aten.to.dtype %arg0, %int5, %false, %false, %none : !torch.vtensor<[1,?,32,128],bf16>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[1,?,32,128],f16>
+  return %0 : !torch.vtensor<[1,?,32,128],f16>
 }

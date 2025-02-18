@@ -6,15 +6,13 @@
 // Also available under a BSD-style license. See LICENSE.
 //
 //===----------------------------------------------------------------------===//
-
+#ifdef TORCH_MLIR_ENABLE_TOSA
 #include "PassDetail.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/OpDefinition.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/Passes.h"
 
@@ -65,3 +63,4 @@ std::unique_ptr<OperationPass<ModuleOp>>
 mlir::torch::TorchConversion::createVerifyTosaBackendContractPass() {
   return std::make_unique<VerifyTosaBackendContractPass>();
 }
+#endif // TORCH_MLIR_ENABLE_TOSA

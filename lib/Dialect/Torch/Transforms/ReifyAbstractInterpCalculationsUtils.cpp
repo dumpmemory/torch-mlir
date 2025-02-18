@@ -8,18 +8,25 @@
 //===----------------------------------------------------------------------===//
 
 #include "ReifyAbstractInterpCalculationsUtils.h"
+#include "mlir/Parser/Parser.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 
 using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
 
-static std::string getLibraryFunctionPrefix(LibraryFunctionKind libFuncKind) {
+std::string
+mlir::torch::Torch::getLibraryFunctionPrefix(LibraryFunctionKind libFuncKind) {
   if (libFuncKind == LibraryFunctionKind::ShapeFunction)
     return "__torch_mlir_shape_fn.";
   else if (libFuncKind == LibraryFunctionKind::DtypeFunction)
     return "__torch_mlir_dtype_fn.";
+  else if (libFuncKind == LibraryFunctionKind::HasValueSemantics)
+    return "__torch_mlir_has_value_semantics_fn.";
   llvm_unreachable(
       "`getLibraryFunctionPrefix` called with an unsupported `CalculateOp`");
 }
@@ -71,8 +78,10 @@ LogicalResult Torch::wrapWithCalculateOpIfLibraryFunctionAvailable(
   // mechanically consistent with existing torch conventions of in-place vs.
   //  out-of-place (value-semantic) variants), remove the prefix when
   // looking them up in the library.
-  if (name.startswith("valsem."))
+  if (name.starts_with("valsem."))
     name = name.drop_front(strlen("valsem."));
+  if (isa<OperatorOp>(op))
+    name = cast<StringAttr>(cast<OperatorOp>(op)->getAttr("name")).getValue();
   std::string libFuncName =
       (getLibraryFunctionPrefix(libFuncKind) + Twine(name)).str();
   auto libFunc = library.lookupSymbol<func::FuncOp>(libFuncName);
@@ -109,7 +118,7 @@ LogicalResult Torch::wrapWithCalculateOpIfLibraryFunctionAvailable(
     assert(call.getNumResults() == 1 &&
            "Multiple results are packed in a tuple in Python!");
     Value result = call.getResult(0);
-    if (auto tupleType = result.getType().dyn_cast<Torch::TupleType>()) {
+    if (auto tupleType = dyn_cast<Torch::TupleType>(result.getType())) {
       auto unpack = b.create<PrimTupleUnpackOp>(
           loc, tupleType.getContainedTypes(), result);
       llvm::append_range(unpackedResults, unpack.getResults());
@@ -149,9 +158,11 @@ void Torch::importLibraryFunctions(ModuleOp module, ModuleOp library,
   }
 }
 
-FailureOr<Value> Torch::adjustFunctionArg(
-    OpBuilder &b, Location loc, Value operand, Type desiredType,
-    function_ref<Value(OpBuilder &, Location, Value, Type)> baseTransformation) {
+FailureOr<Value>
+Torch::adjustFunctionArg(OpBuilder &b, Location loc, Value operand,
+                         Type desiredType,
+                         function_ref<Value(OpBuilder &, Location, Value, Type)>
+                             baseTransformation) {
   operand = baseTransformation(b, loc, operand, desiredType);
 
   // No need for adjustment if they already match.
@@ -159,7 +170,7 @@ FailureOr<Value> Torch::adjustFunctionArg(
   if (operandType == desiredType)
     return operand;
 
-  if (desiredType.isa<Torch::AnyType>()) {
+  if (isa<Torch::AnyType>(desiredType)) {
     // Generator's are currently passed as Any because TorchScript cannot
     // compile a function with Generator type arguments.
     // Ignoring that hack, this is a correct handling of Any type should we need
@@ -167,22 +178,42 @@ FailureOr<Value> Torch::adjustFunctionArg(
     return b.create<DerefineOp>(loc, desiredType, operand).getResult();
   }
 
-  // !torch.union<int, float> is the type used for `Scalar` inputs. At
-  // compile time, such inputs will usually be resolved to an `int` or a `float`
-  // so we need to derefine to match the library function signature.
-  if (auto unionType = desiredType.dyn_cast<Torch::UnionType>()) {
+  // The type `!torch.number` can be an `int`, `float`, or `complex`.
+  // TODO: Add a new type `Torch::ComplexType` to handle the complex case.
+  if (isa<Torch::NumberType>(desiredType) &&
+      isa<Torch::IntType, Torch::FloatType>(operandType)) {
+    return b.create<DerefineOp>(loc, desiredType, operand).getResult();
+  }
+
+  // !torch.union<int, float, none> is the type used for optional
+  // `Scalar` inputs. At compile time, such inputs will usually be
+  // resolved to an `int`, `float`, or `None` so we need to derefine
+  // to match the library function signature.
+  if (auto unionType = dyn_cast<Torch::UnionType>(desiredType)) {
     if (llvm::all_of(unionType.getContainedTypes(), [](Type containedType) {
-          return containedType.isa<Torch::IntType, Torch::FloatType>();
+          return isa<Torch::IntType, Torch::FloatType, Torch::NoneType>(
+              containedType);
         }))
       return b.create<DerefineOp>(loc, desiredType, operand).getResult();
   }
 
-  // If the operand is NoneType, then we just need to derefine it to the
-  // optional type in the function signature.
-  if (operandType.isa<Torch::NoneType>()) {
-    assert(desiredType.isa<Torch::OptionalType>() &&
+  // Operands with type `!torch.none` correspond to library function inputs with
+  // types like `!torch.optional<...>` or `!torch.union<..., none>`, so here the
+  // type is derefined to match the expected type of the library function.
+  if (isa<Torch::NoneType>(operandType)) {
+    assert(!isa<Torch::NoneType>(desiredType) &&
            "Don't expect library functions to have NoneType parameters");
     return b.create<DerefineOp>(loc, desiredType, operand).getResult();
+  }
+
+  // To keep things simple in shape functions, `Scalar` inputs are considered
+  // `float`s. This is safe since output shape of torch ops never depends on the
+  // dtype of input scalars. However, this also means we sometimes have to
+  // manually turn `Scalar`s into `float`s when inserting the shape functions
+  // into the IR.
+  if (isa<Torch::NumberType>(operandType) &&
+      isa<Torch::FloatType>(desiredType)) {
+    return b.create<AtenFloatScalarOp>(loc, desiredType, operand).getResult();
   }
 
   // If the operand type is statically !torch.optional, then we need to do
@@ -193,8 +224,8 @@ FailureOr<Value> Torch::adjustFunctionArg(
   // type).
   // A case where this happens is `!torch.optional<vtensor>` ->
   // `!torch.optional<list<int>>>`.
-  if (auto operandOptionalType = operandType.dyn_cast<Torch::OptionalType>()) {
-    if (desiredType.isa<Torch::OptionalType>()) {
+  if (auto operandOptionalType = dyn_cast<Torch::OptionalType>(operandType)) {
+    if (isa<Torch::OptionalType>(desiredType)) {
       // if optional is None:
       //     return derefine(None)
       // else:
@@ -227,7 +258,7 @@ FailureOr<Value> Torch::adjustFunctionArg(
   // If the desired type is OptionalType, then recursively adjust the operand to
   // the contained type, then derefine it to `!torch.optional`. For example,
   // `!torch.vtensor -> !torch.optional<list<int>>>`.
-  if (auto desiredOptionalType = desiredType.dyn_cast<Torch::OptionalType>()) {
+  if (auto desiredOptionalType = dyn_cast<Torch::OptionalType>(desiredType)) {
     FailureOr<Value> adjusted = adjustFunctionArg(
         b, loc, operand, desiredOptionalType.getContainedType(),
         baseTransformation);
@@ -236,7 +267,7 @@ FailureOr<Value> Torch::adjustFunctionArg(
     return b.create<DerefineOp>(loc, desiredType, *adjusted).getResult();
   }
 
-  if (auto desiredListType = desiredType.dyn_cast<Torch::ListType>()) {
+  if (auto desiredListType = dyn_cast<Torch::ListType>(desiredType)) {
     // Pseudocode:
     //
     // operand = ...
@@ -244,7 +275,7 @@ FailureOr<Value> Torch::adjustFunctionArg(
     // for i in range(len(operand)):
     //     adjusted_list.append(adjust(operand[i]))
     // return adjusted_list
-    auto providedType = operand.getType().cast<Torch::ListType>();
+    auto providedType = cast<Torch::ListType>(operand.getType());
     Value adjustedList =
         b.create<PrimListConstructOp>(loc, desiredListType, ValueRange({}));
     // Create a for-like PrimLoopOp.
@@ -280,11 +311,47 @@ FailureOr<Value> Torch::adjustFunctionArg(
   // The library functions use `float` where the operator
   // signature uses `Scalar` (see comments in torch_ods_gen.py for
   // explanation).
-  if (desiredType.isa<Torch::FloatType>() &&
-      operand.getType().isa<Torch::IntType>()) {
+  if (isa<Torch::FloatType>(desiredType) &&
+      isa<Torch::IntType>(operand.getType())) {
     return b.create<AtenFloatScalarOp>(loc, desiredType, operand).getResult();
   }
 
   // Pass the operand as-is.
   return operand;
+}
+
+LogicalResult
+mlir::torch::Torch::loadExtraLibrary(const std::string &filename,
+                                     OwningOpRef<ModuleOp> &moduleToAppendTo) {
+  auto ctx = moduleToAppendTo->getContext();
+  assert(ctx && "Module should be fully initialized.");
+
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
+      llvm::MemoryBuffer::getFileOrSTDIN(filename);
+  if (std::error_code ec = fileOrErr.getError()) {
+    llvm::errs() << "Could not open input file: " << ec.message() << "\n";
+    return failure();
+  }
+
+  llvm::SourceMgr sourceMgr;
+  sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
+  OwningOpRef<ModuleOp> module_ =
+      mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, ctx);
+  if (!module_) {
+    llvm::errs() << "Error can't load file " << filename << "\n";
+    return failure();
+  }
+
+  assert((moduleToAppendTo->getBodyRegion().empty() ||
+          moduleToAppendTo->getBodyRegion().hasOneBlock()) &&
+         "Module should have at most one block.");
+  if (moduleToAppendTo->getBodyRegion().empty()) {
+    moduleToAppendTo = std::move(module_);
+  } else {
+    Block *block = moduleToAppendTo->getBody(0);
+    block->getOperations().splice(block->end(),
+                                  module_->getBody(0)->getOperations());
+  }
+
+  return success();
 }

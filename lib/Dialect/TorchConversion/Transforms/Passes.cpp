@@ -9,27 +9,29 @@
 
 #include "torch-mlir/Dialect/TorchConversion/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
-#include "mlir/Dialect/Func/Transforms/Passes.h"
-#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
-#include "mlir/Dialect/Tosa/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "torch-mlir/Conversion/TorchConversionToMLProgram/TorchConversionToMLProgram.h"
+#include "torch-mlir/Conversion/TorchToArith/TorchToArith.h"
 #include "torch-mlir/Conversion/TorchToLinalg/TorchToLinalg.h"
 #include "torch-mlir/Conversion/TorchToSCF/TorchToSCF.h"
-#include "torch-mlir/Conversion/TorchToArith/TorchToArith.h"
 #include "torch-mlir/Conversion/TorchToTMTensor/TorchToTMTensor.h"
-#include "torch-mlir/Conversion/TorchToTosa/TorchToTosa.h"
-#include "torch-mlir/Conversion/TorchConversionToMLProgram/TorchConversionToMLProgram.h"
-#ifdef TORCH_MLIR_ENABLE_MHLO
-#include "mhlo/transforms/passes.h"
-#include "torch-mlir/Conversion/TorchToMhlo/TorchToMhlo.h"
-#endif
+#include "torch-mlir/Conversion/TorchToTensor/TorchToTensor.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
+
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+#include "stablehlo/transforms/Passes.h"
+#include "torch-mlir/Conversion/TorchToStablehlo/TorchToStablehlo.h"
+#endif
+
+#ifdef TORCH_MLIR_ENABLE_TOSA
+#include "torch-mlir/Conversion/TorchToTosa/TorchToTosa.h"
+using namespace mlir::tosa;
+#endif
 
 using namespace mlir;
 using namespace mlir::torch;
-using namespace mlir::tosa;
 
 //===----------------------------------------------------------------------===//
 // Pass registration
@@ -47,32 +49,44 @@ void mlir::torch::registerTorchConversionPasses() {
       "Pipeline lowering torch backend contract to linalg-on-tensors backend "
       "contract.",
       TorchConversion::createTorchBackendToLinalgOnTensorsBackendPipeline);
-
+#ifdef TORCH_MLIR_ENABLE_TOSA
   mlir::PassPipelineRegistration<>(
       "torch-backend-to-tosa-backend-pipeline",
       "Pipeline lowering torch backend contract to TOSA backend "
       "contract.",
       TorchConversion::createTorchBackendToTosaBackendPipeline);
-#ifdef TORCH_MLIR_ENABLE_MHLO
-  mlir::PassPipelineRegistration<TorchConversion::MhloBackendPipelineOptions>(
-      "torch-backend-to-mhlo-backend-pipeline",
-      "Pipeline lowering torch backend contract to MHLO backend "
+#endif
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+  mlir::PassPipelineRegistration<
+      TorchConversion::StablehloBackendPipelineOptions>(
+      "torch-backend-to-stablehlo-backend-pipeline",
+      "Pipeline lowering torch backend contract to StableHLO backend "
       "contract.",
-      TorchConversion::createTorchBackendToMhloBackendPipeline);
+      TorchConversion::createTorchBackendToStablehloBackendPipeline);
 #endif
 }
 
 void TorchConversion::createTorchBackendToLinalgOnTensorsBackendPipeline(
     OpPassManager &pm) {
+  // Fix non constant dims passed to reduction ops
+  pm.addNestedPass<func::FuncOp>(
+      torch::Torch::createRestructureNonConstantAxesPass());
+
+  // We want to fuse quantized operations together before lowering to linalg.
+  pm.addNestedPass<func::FuncOp>(Torch::createFuseQuantizedOpsPass());
+
   // Lower to linalg + guards which is the input to codegen backends.
   // We do this first as it tends to involve pattern-matching against constants,
   // (e.g. dimensions which must be constant in a ranked programming model)
   // and those constants get somewhat obscured by TorchToArith.
   pm.addNestedPass<func::FuncOp>(createConvertTorchToTMTensorPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createConvertTorchToLinalgPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createConvertTorchToSCFPass());
   pm.addNestedPass<func::FuncOp>(createConvertTorchToArithPass());
-  pm.addNestedPass<func::FuncOp>(createConvertTorchConversionToMLProgramPass());
+  pm.addNestedPass<func::FuncOp>(createConvertTorchToTensorPass());
+  pm.addPass(createConvertTorchConversionToMLProgramPass());
   pm.addNestedPass<func::FuncOp>(memref::createExpandOpsPass());
 
   // Clean up any non-canonical code introduced above..
@@ -97,6 +111,7 @@ void TorchConversion::createTorchBackendToLinalgOnTensorsBackendPipeline(
   pm.addPass(TorchConversion::createVerifyLinalgOnTensorsBackendContractPass());
 }
 
+#ifdef TORCH_MLIR_ENABLE_TOSA
 void TorchConversion::createTorchBackendToTosaBackendPipeline(
     OpPassManager &pm) {
   pm.addNestedPass<func::FuncOp>(createConvertTorchToTosaPass());
@@ -120,34 +135,52 @@ void TorchConversion::createTorchBackendToTosaBackendPipeline(
   // correct form.
   pm.addPass(TorchConversion::createVerifyTosaBackendContractPass());
 }
+#endif
 
-#ifdef TORCH_MLIR_ENABLE_MHLO
-void TorchConversion::createTorchBackendToMhloBackendPipeline(
+#ifdef TORCH_MLIR_ENABLE_STABLEHLO
+void TorchConversion::createTorchBackendToStablehloBackendPipeline(
     OpPassManager &pm,
-    const TorchConversion::MhloBackendPipelineOptions &options) {
-  pm.addNestedPass<func::FuncOp>(createConvertTorchToMhloPass(
+    const TorchConversion::StablehloBackendPipelineOptions &options) {
+  // Generate Stablehlo & Chlo ops.
+  pm.addNestedPass<func::FuncOp>(createConvertTorchToStablehloPass(
       options.enableStaticShape, options.enableI32Index));
+  // Lowering Chlo ops to Stablehlo
+  pm.addNestedPass<func::FuncOp>(
+      stablehlo::createChloLegalizeToStablehloPass());
+  // Lowering remained ops to Arith
+  pm.addNestedPass<func::FuncOp>(createConvertTorchToArithPass());
 
-  // Clean up any non-canonical code introduced above..
-  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  // The resolution of `dim` ops tends to create identical ops. CSE them.
-  pm.addNestedPass<func::FuncOp>(createCSEPass());
-
-  // Convert CHLO ops to MHLO ops
-  pm.addNestedPass<func::FuncOp>(mhlo::createChloLegalizeToHloPass());
   // Clean up any non-canonical code introduced above..
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   // The resolution of `dim` ops tends to create identical ops. CSE them.
   pm.addNestedPass<func::FuncOp>(createCSEPass());
 
   // Finish the type conversion from `torch` types to the types of the
-  // MHLO backend contract.
-  pm.addPass(TorchConversion::createFuncBackendTypeConversionPass());
+  // StableHLO backend contract.
+  pm.addPass(
+      TorchConversion::createFuncBackendTypeConversionForStablehloPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(
-      TorchConversion::createFinalizingBackendTypeConversionPass());
-  // Verify that we have lowered to the form that MHLO backends
-  // expect. This fails compilation (signalPassFailure) if the IR is not in the
-  // correct form.
-  pm.addPass(TorchConversion::createVerifyMhloBackendContractPass());
+      TorchConversion::createFinalizingBackendTypeConversionForStablehloPass());
+
+  // Verify that we have lowered to Stablehlo ops.
+  pm.addPass(TorchConversion::createVerifyStablehloBackendContractPass());
+
+  // Canonicalize Stablehlo dynamic ops to static ops
+  pm.addNestedPass<func::FuncOp>(
+      stablehlo::createStablehloCanonicalizeDynamismPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  pm.addPass(stablehlo::createStablehloRefineShapesPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(
+      stablehlo::createStablehloCanonicalizeDynamismPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+
+  // Legalize deprecated ops to Stablehlo ops
+  stablehlo::StablehloLegalizeDeprecatedOpsPassOptions stablehloOptions;
+  stablehloOptions.failOnUnusedOps = false;
+  pm.addNestedPass<func::FuncOp>(
+      stablehlo::createStablehloLegalizeDeprecatedOpsPass(stablehloOptions));
+  pm.addPass(createCanonicalizerPass());
 }
 #endif

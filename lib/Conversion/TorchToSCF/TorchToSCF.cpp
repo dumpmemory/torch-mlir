@@ -12,12 +12,10 @@
 #include "../PassDetail.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchTypes.h"
-#include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionDialect.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/BackendTypeConversion.h"
 
 using namespace mlir;
@@ -77,7 +75,7 @@ public:
     if (op.isForLike())
       return failure();
 
-    TypeConverter *typeConverter = getTypeConverter();
+    const TypeConverter *typeConverter = getTypeConverter();
     SmallVector<Type, 1> newResultTypes;
     if (failed(
             typeConverter->convertTypes(op.getResultTypes(), newResultTypes)))
@@ -140,11 +138,11 @@ public:
 
       // If the target type is non-torch type, then use TypeConverter to convert
       // the type of the source.
-      if (targetType.isa<mlir::FloatType>()) {
+      if (isa<mlir::FloatType>(targetType)) {
         targetType = Torch::FloatType::get(op->getContext());
         torchArg = typeConverter->materializeSourceConversion(
             rewriter, scfWhileOp.getLoc(), targetType, {to});
-      } else if (targetType.isa<mlir::IntegerType>()) {
+      } else if (isa<mlir::IntegerType>(targetType)) {
         unsigned bitWidth = targetType.getIntOrFloatBitWidth();
         if (bitWidth == 1)
           targetType = Torch::BoolType::get(op->getContext());
@@ -179,7 +177,7 @@ public:
 
           // If the argument is a torch tensor, directly add it in the list of
           // iter args.
-          if (torchType.isa<Torch::BaseTensorType>()) {
+          if (isa<Torch::BaseTensorType>(torchType)) {
             loopConditionIterArgs.push_back(torchArg);
             continue;
           }
@@ -217,7 +215,7 @@ public:
     if (!op.isForLike())
       return failure();
 
-    TypeConverter *typeConverter = getTypeConverter();
+    const TypeConverter *typeConverter = getTypeConverter();
     SmallVector<Type, 1> newResultTypes;
     if (failed(
             typeConverter->convertTypes(op.getResultTypes(), newResultTypes)))
@@ -237,24 +235,24 @@ public:
 
     SmallVector<Type> regionArgTypes;
     SmallVector<Location> regionArgLocs;
-    for (Value value : scfForOp.getLoopBody().front().getArguments()) {
+    for (Value value : scfForOp.getRegion().front().getArguments()) {
       regionArgTypes.push_back(value.getType());
       regionArgLocs.push_back(value.getLoc());
     }
 
     // Populate the loop body region.
-    if (!scfForOp.getLoopBody().empty())
-      rewriter.eraseBlock(&scfForOp.getLoopBody().back());
+    if (!scfForOp.getRegion().empty())
+      rewriter.eraseBlock(&scfForOp.getRegion().back());
 
-    auto *block = rewriter.createBlock(&scfForOp.getLoopBody(),
-                                       scfForOp.getLoopBody().begin(),
+    auto *block = rewriter.createBlock(&scfForOp.getRegion(),
+                                       scfForOp.getRegion().begin(),
                                        regionArgTypes, regionArgLocs);
 
     // Rewrite uses of the torch loop block arguments to the new for-loop
     // "block" arguments
     for (const auto &barg : enumerate(op.getRegion().front().getArguments())) {
       Value to = block->getArgument(barg.index());
-      if (to.getType().isa<mlir::IndexType>())
+      if (isa<mlir::IndexType>(to.getType()))
         to =
             rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), to);
       Type targetType = to.getType();
@@ -262,11 +260,11 @@ public:
 
       // If the target type is non-torch type, then use TypeConverter to convert
       // the type of the source.
-      if (targetType.isa<mlir::FloatType>()) {
+      if (isa<mlir::FloatType>(targetType)) {
         targetType = Torch::FloatType::get(op->getContext());
         torchArg = typeConverter->materializeSourceConversion(
             rewriter, scfForOp.getLoc(), targetType, {to});
-      } else if (targetType.isa<mlir::IntegerType>()) {
+      } else if (isa<mlir::IntegerType>(targetType)) {
         unsigned bitWidth = targetType.getIntOrFloatBitWidth();
         if (bitWidth == 1)
           targetType = Torch::BoolType::get(op->getContext());
@@ -274,7 +272,14 @@ public:
           targetType = Torch::IntType::get(op->getContext());
         torchArg = typeConverter->materializeSourceConversion(
             rewriter, scfForOp.getLoc(), targetType, {to});
+      } else if (auto tty = dyn_cast<RankedTensorType>(targetType)) {
+        targetType =
+            op.getIterArgsInit()[barg.index() - scfForOp.getNumInductionVars()]
+                .getType();
+        torchArg = typeConverter->materializeSourceConversion(
+            rewriter, scfForOp.getLoc(), targetType, {to});
       }
+
       if (!torchArg)
         return rewriter.notifyMatchFailure(op,
                                            "unsupported type of the operand");
@@ -289,14 +294,6 @@ public:
         // Fix up the terminator.
         SmallVector<Value> loopConditionIterArgs;
         for (auto torchArg : primLoopConditionOp.getIterArgs()) {
-          Type torchType = torchArg.getType();
-
-          // If the argument is a torch tensor, directly add it in the list of
-          // iter args.
-          if (torchType.isa<Torch::BaseTensorType>()) {
-            loopConditionIterArgs.push_back(torchArg);
-            continue;
-          }
           Value arg = typeConverter->materializeTargetConversion(
               rewriter, scfForOp.getLoc(),
               typeConverter->convertType(torchArg.getType()), {torchArg});
